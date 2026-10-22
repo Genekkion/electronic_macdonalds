@@ -1,71 +1,53 @@
 const std = @import("std");
-const Io = std.Io;
 
-const electronic_macdonalds = @import("electronic_macdonalds");
+const c = @cImport({
+    @cInclude("lua.h");
+    @cInclude("lauxlib.h");
+    @cInclude("lualib.h");
+    @cInclude("macos_window.h");
+});
 
-pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+fn luaDoString(L: ?*c.lua_State, code: [:0]const u8) c_int {
+    if (c.luaL_loadstring(L, code) != 0) return 1;
+    return c.lua_pcallk(L, 0, c.LUA_MULTRET, 0, 0, null);
+}
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+fn luaToString(L: ?*c.lua_State, idx: c_int) ?[*:0]const u8 {
+    return c.lua_tolstring(L, idx, null);
+}
 
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+pub fn main() !void {
+    std.debug.print("Initializing Electronic Macdonalds...\n", .{});
+
+    // 1. Initialize Lua VM
+    const L = c.luaL_newstate();
+    if (L == null) {
+        std.debug.print("Failed to initialize Lua state\n", .{});
+        return error.LuaInitFailed;
+    }
+    defer c.lua_close(L);
+    c.luaL_openlibs(L);
+
+    // Test Lua execution
+    const test_script = "print(\"Hello from embedded Lua! Version: \" .. _VERSION)";
+    if (luaDoString(L, test_script) != c.LUA_OK) {
+        if (luaToString(L, -1)) |err_msg| {
+            std.debug.print("Lua Error: {s}\n", .{err_msg});
+        }
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    // 2. Initialize macOS AppKit GUI
+    if (!c.macos_app_init()) {
+        std.debug.print("Failed to initialize macOS application\n", .{});
+        return error.AppInitFailed;
+    }
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    const window = c.macos_window_create("Electronic Macdonalds", 1024, 768);
+    if (window == null) {
+        std.debug.print("Failed to create window\n", .{});
+        return error.WindowCreateFailed;
+    }
 
-    try electronic_macdonalds.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+    std.debug.print("Window created successfully (1024x768). Running event loop...\n", .{});
+    c.macos_app_run();
 }
