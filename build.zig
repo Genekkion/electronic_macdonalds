@@ -67,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .root = b.path("src/platform"),
         .files = &.{
             "macos_window.m",
+            "macos_font.m",
         },
         .flags = &.{
             "-fobjc-arc",
@@ -82,6 +83,7 @@ pub fn build(b: *std.Build) void {
     }
     exe.root_module.linkFramework("Cocoa", .{});
     exe.root_module.linkFramework("CoreText", .{});
+    exe.root_module.linkFramework("CoreFoundation", .{});
     exe.root_module.linkFramework("Metal", .{});
     exe.root_module.linkFramework("QuartzCore", .{});
 
@@ -108,6 +110,26 @@ pub fn build(b: *std.Build) void {
         .files = lua_sources,
         .flags = &.{"-std=c99"},
     });
+
+    test_mod.addIncludePath(b.path("src/platform"));
+    test_mod.addCSourceFiles(.{
+        .root = b.path("src/platform"),
+        .files = &.{
+            "macos_font.m",
+        },
+        .flags = &.{
+            "-fobjc-arc",
+        },
+    });
+
+    if (b.graph.environ_map.get("SDKROOT")) |sdk| {
+        const fw_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
+        test_mod.addFrameworkPath(.{ .cwd_relative = fw_path });
+    } else {
+        test_mod.addFrameworkPath(.{ .cwd_relative = "/System/Library/Frameworks" });
+    }
+    test_mod.linkFramework("CoreText", .{});
+    test_mod.linkFramework("CoreFoundation", .{});
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <CoreText/CoreText.h>
 #include "macos_window.h"
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
@@ -22,6 +23,109 @@
 }
 @end
 
+@interface EditorView : NSView
+@property (nonatomic, assign) void *ctx;
+@property (nonatomic, assign) GetLineCallback getLineCb;
+@property (nonatomic, assign) GetLineCountCallback getLineCountCb;
+@property (nonatomic, assign) int cursorLine;
+@property (nonatomic, assign) int cursorCol;
+@property (nonatomic, assign) CTFontRef font;
+@property (nonatomic, assign) CGFloat charWidth;
+@property (nonatomic, assign) CGFloat lineHeight;
+@property (nonatomic, assign) CGFloat ascent;
+@end
+
+@implementation EditorView
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        _cursorLine = 0;
+        _cursorCol = 0;
+
+        _font = CTFontCreateWithName(CFSTR("Menlo"), 14.0, NULL);
+        if (_font) {
+            _ascent = CTFontGetAscent(_font);
+            CGFloat descent = CTFontGetDescent(_font);
+            CGFloat leading = CTFontGetLeading(_font);
+            _lineHeight = ceil(_ascent + descent + leading);
+
+            CGGlyph glyphs[1];
+            UniChar chars[1] = { 'M' };
+            if (CTFontGetGlyphsForCharacters(_font, chars, glyphs, 1)) {
+                CGSize advance;
+                CTFontGetAdvancesForGlyphs(_font, kCTFontOrientationHorizontal, glyphs, &advance, 1);
+                _charWidth = advance.width;
+            } else {
+                _charWidth = 8.0;
+            }
+        } else {
+            _charWidth = 8.0;
+            _lineHeight = 16.0;
+            _ascent = 12.0;
+        }
+    }
+    return self;
+}
+
+- (void)dealloc {
+    if (_font) {
+        CFRelease(_font);
+    }
+}
+
+- (BOOL)isFlipped {
+    return YES;
+}
+
+- (BOOL)acceptsFirstResponder {
+    return YES;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    CGContextRef context = (CGContextRef)[[NSGraphicsContext currentContext] CGContext];
+    if (!context) return;
+
+    // 1. Draw background (#1e1e1e)
+    CGContextSetRGBFillColor(context, 0.118, 0.118, 0.118, 1.0);
+    CGContextFillRect(context, self.bounds);
+
+    if (!_getLineCb || !_getLineCountCb || !_font) return;
+
+    int totalLines = _getLineCountCb(_ctx);
+    int visibleRows = (int)ceil(self.bounds.size.height / _lineHeight);
+    int maxLine = totalLines < visibleRows ? totalLines : visibleRows;
+
+    // Attributes for text rendering
+    NSColor *textColor = [NSColor colorWithCalibratedRed:0.88 green:0.88 blue:0.88 alpha:1.0];
+    NSDictionary *attributes = @{
+        NSFontAttributeName: (__bridge id)_font,
+        NSForegroundColorAttributeName: textColor
+    };
+
+    // 2. Draw lines of text
+    for (int i = 0; i < maxLine; i++) {
+        int len = 0;
+        const char *bytes = _getLineCb(_ctx, i, &len);
+        if (bytes && len > 0) {
+            NSString *str = [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
+            if (str) {
+                NSAttributedString *attrStr = [[NSAttributedString alloc] initWithString:str attributes:attributes];
+                [attrStr drawAtPoint:NSMakePoint(10.0, i * _lineHeight)];
+            }
+        }
+    }
+
+    // 3. Draw cursor (block cursor #528bff)
+    CGFloat cursorX = 10.0 + _cursorCol * _charWidth;
+    CGFloat cursorY = _cursorLine * _lineHeight;
+    NSRect cursorRect = NSMakeRect(cursorX, cursorY, _charWidth, _lineHeight);
+    CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.6);
+    CGContextFillRect(context, cursorRect);
+}
+
+@end
+
 static AppDelegate *g_app_delegate = nil;
 
 bool macos_app_init(void) {
@@ -31,7 +135,6 @@ bool macos_app_init(void) {
         g_app_delegate = [[AppDelegate alloc] init];
         [NSApp setDelegate:g_app_delegate];
 
-        // Create basic menu bar for Cmd+Q quit support
         id menubar = [[NSMenu alloc] init];
         id appMenuItem = [[NSMenuItem alloc] init];
         [menubar addItem:appMenuItem];
@@ -79,6 +182,44 @@ void macos_window_set_close_callback(void *win, WindowCloseCallback cb) {
         WindowDelegate *delegate = [[WindowDelegate alloc] init];
         delegate.closeCallback = cb;
         [window setDelegate:delegate];
+    }
+}
+
+void macos_window_attach_editor_view(
+    void *win,
+    void *ctx,
+    GetLineCallback get_line,
+    GetLineCountCallback get_line_count
+) {
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win;
+        NSRect contentBounds = [[window contentView] bounds];
+        EditorView *view = [[EditorView alloc] initWithFrame:contentBounds];
+        view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        view.ctx = ctx;
+        view.getLineCb = get_line;
+        view.getLineCountCb = get_line_count;
+        [window setContentView:view];
+        [window makeFirstResponder:view];
+    }
+}
+
+void macos_window_set_cursor(void *win, int line, int col) {
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win;
+        if ([[window contentView] isKindOfClass:[EditorView class]]) {
+            EditorView *view = (EditorView *)[window contentView];
+            view.cursorLine = line;
+            view.cursorCol = col;
+            [view setNeedsDisplay:YES];
+        }
+    }
+}
+
+void macos_window_redraw(void *win) {
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win;
+        [[window contentView] setNeedsDisplay:YES];
     }
 }
 
