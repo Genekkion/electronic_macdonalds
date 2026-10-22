@@ -2,3 +2,5 @@
 .envrc
 .zig-cache/
 zig-out/
+research/
+lua
