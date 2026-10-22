@@ -27,8 +27,11 @@
 @property (nonatomic, assign) void *ctx;
 @property (nonatomic, assign) GetLineCallback getLineCb;
 @property (nonatomic, assign) GetLineCountCallback getLineCountCb;
+@property (nonatomic, assign) KeyDownCallback keyDownCb;
 @property (nonatomic, assign) int cursorLine;
 @property (nonatomic, assign) int cursorCol;
+@property (nonatomic, assign) BOOL cursorVisible;
+@property (nonatomic, strong) NSTimer *blinkTimer;
 @property (nonatomic, assign) CTFontRef font;
 @property (nonatomic, assign) CGFloat charWidth;
 @property (nonatomic, assign) CGFloat lineHeight;
@@ -42,6 +45,7 @@
     if (self) {
         _cursorLine = 0;
         _cursorCol = 0;
+        _cursorVisible = YES;
 
         _font = CTFontCreateWithName(CFSTR("Menlo"), 14.0, NULL);
         if (_font) {
@@ -64,11 +68,23 @@
             _lineHeight = 16.0;
             _ascent = 12.0;
         }
+
+        _blinkTimer = [NSTimer scheduledTimerWithTimeInterval:0.55
+                                                       target:self
+                                                     selector:@selector(blinkCursor:)
+                                                     userInfo:nil
+                                                      repeats:YES];
     }
     return self;
 }
 
+- (void)blinkCursor:(NSTimer *)timer {
+    _cursorVisible = !_cursorVisible;
+    [self setNeedsDisplay:YES];
+}
+
 - (void)dealloc {
+    [_blinkTimer invalidate];
     if (_font) {
         CFRelease(_font);
     }
@@ -80,6 +96,26 @@
 
 - (BOOL)acceptsFirstResponder {
     return YES;
+}
+
+- (void)keyDown:(NSEvent *)event {
+    NSUInteger flags = [event modifierFlags];
+    int mods = 0;
+    if (flags & NSEventModifierFlagShift) mods |= 1;
+    if (flags & NSEventModifierFlagControl) mods |= 2;
+    if (flags & NSEventModifierFlagOption) mods |= 4;
+    if (flags & NSEventModifierFlagCommand) mods |= 8;
+
+    NSString *chars = [event characters];
+    const char *utf8 = chars ? [chars UTF8String] : "";
+    unsigned short keyCode = [event keyCode];
+
+    _cursorVisible = YES;
+
+    if (_keyDownCb) {
+        _keyDownCb(_ctx, utf8, (int)keyCode, mods);
+    }
+    [self setNeedsDisplay:YES];
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
@@ -116,12 +152,14 @@
         }
     }
 
-    // 3. Draw cursor (block cursor #528bff)
-    CGFloat cursorX = 10.0 + _cursorCol * _charWidth;
-    CGFloat cursorY = _cursorLine * _lineHeight;
-    NSRect cursorRect = NSMakeRect(cursorX, cursorY, _charWidth, _lineHeight);
-    CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.6);
-    CGContextFillRect(context, cursorRect);
+    // 3. Draw cursor (block cursor #528bff with blinking)
+    if (_cursorVisible) {
+        CGFloat cursorX = 10.0 + _cursorCol * _charWidth;
+        CGFloat cursorY = _cursorLine * _lineHeight;
+        NSRect cursorRect = NSMakeRect(cursorX, cursorY, _charWidth, _lineHeight);
+        CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.65);
+        CGContextFillRect(context, cursorRect);
+    }
 }
 
 @end
@@ -189,7 +227,8 @@ void macos_window_attach_editor_view(
     void *win,
     void *ctx,
     GetLineCallback get_line,
-    GetLineCountCallback get_line_count
+    GetLineCountCallback get_line_count,
+    KeyDownCallback on_key_down
 ) {
     @autoreleasepool {
         NSWindow *window = (__bridge NSWindow *)win;
@@ -199,6 +238,7 @@ void macos_window_attach_editor_view(
         view.ctx = ctx;
         view.getLineCb = get_line;
         view.getLineCountCb = get_line_count;
+        view.keyDownCb = on_key_down;
         [window setContentView:view];
         [window makeFirstResponder:view];
     }
