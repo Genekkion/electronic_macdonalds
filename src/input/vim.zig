@@ -279,6 +279,95 @@ pub const EditorState = struct {
         self.set_cursor_from_offset(buf, offset);
     }
 
+    fn move_first_non_blank(self: *EditorState, buf: *const Buffer) void {
+        const len = get_line_len(buf, self.cursor.line);
+        if (len == 0) {
+            self.cursor.col = 0;
+            self.cursor.desired_col = 0;
+            return;
+        }
+        const line_start = buf.lines.get_line_start(self.cursor.line) orelse 0;
+        var col: usize = 0;
+        while (col < len) : (col += 1) {
+            const ch = buf.byte_at(line_start + col) orelse break;
+            if (ch != ' ' and ch != '\t') break;
+        }
+        self.cursor.col = if (col < len) col else 0;
+        self.cursor.desired_col = self.cursor.col;
+    }
+
+    fn move_word_end(self: *EditorState, buf: *const Buffer) void {
+        const total_len = buf.len();
+        if (total_len == 0) return;
+
+        const line_start = buf.lines.get_line_start(self.cursor.line) orelse 0;
+        var offset = line_start + self.cursor.col;
+        if (offset + 1 >= total_len) return;
+
+        offset += 1;
+
+        while (offset < total_len) {
+            const ch = buf.byte_at(offset) orelse break;
+            if (char_kind(ch) != .space) break;
+            offset += 1;
+        }
+
+        if (offset >= total_len) {
+            self.set_cursor_from_offset(buf, total_len - 1);
+            return;
+        }
+
+        const cur_ch = buf.byte_at(offset) orelse return;
+        const kind = char_kind(cur_ch);
+
+        while (offset + 1 < total_len) {
+            const next_ch = buf.byte_at(offset + 1) orelse break;
+            if (char_kind(next_ch) != kind) break;
+            offset += 1;
+        }
+
+        self.set_cursor_from_offset(buf, offset);
+    }
+
+    fn move_selected_lines(self: *EditorState, buf: *Buffer, dir_down: bool) !void {
+        const anchor = self.anchor orelse return;
+        const start_line = @min(self.cursor.line, anchor.line);
+        const end_line = @max(self.cursor.line, anchor.line);
+
+        if (dir_down) {
+            if (end_line + 1 >= buf.line_count()) return;
+            const below_start = buf.lines.get_line_start(end_line + 1) orelse return;
+            const below_len = get_line_len(buf, end_line + 1);
+            const has_nl = (below_start + below_len < buf.len() and buf.byte_at(below_start + below_len) == '\n');
+            const total_below = below_len + if (has_nl) @as(usize, 1) else 0;
+            const below_slice = try buf.get_slice(buf.allocator, below_start, below_start + total_below);
+            defer buf.allocator.free(below_slice);
+
+            try buf.delete(below_start, total_below);
+            const ins_pos = buf.lines.get_line_start(start_line) orelse 0;
+            try buf.insert(ins_pos, below_slice);
+
+            self.cursor.line += 1;
+            if (self.anchor) |*a| a.line += 1;
+        } else {
+            if (start_line == 0) return;
+            const above_start = buf.lines.get_line_start(start_line - 1) orelse return;
+            const above_len = get_line_len(buf, start_line - 1);
+            const has_nl = (above_start + above_len < buf.len() and buf.byte_at(above_start + above_len) == '\n');
+            const total_above = above_len + if (has_nl) @as(usize, 1) else 0;
+            const above_slice = try buf.get_slice(buf.allocator, above_start, above_start + total_above);
+            defer buf.allocator.free(above_slice);
+
+            try buf.delete(above_start, total_above);
+            const new_end = end_line - 1;
+            const below_end_start = if (new_end + 1 < buf.line_count()) buf.lines.get_line_start(new_end + 1) orelse buf.len() else buf.len();
+            try buf.insert(below_end_start, above_slice);
+
+            self.cursor.line -= 1;
+            if (self.anchor) |*a| a.line -= 1;
+        }
+    }
+
     fn move_word_backward(self: *EditorState, buf: *const Buffer) void {
         const total_len = buf.len();
         if (total_len == 0) return;
@@ -359,12 +448,18 @@ pub const EditorState = struct {
                         'G' => self.goto_line(buf, null),
                         'y' => try self.yank_selection(buf),
                         'd', 'x' => try self.delete_selection(buf),
-                        'h', 'l', 'j', 'k', '0', '$', 'w', 'b' => self.handle_motion_key(buf, ch, 1),
+                        'J' => try self.move_selected_lines(buf, true),
+                        'K' => try self.move_selected_lines(buf, false),
+                        'h', 'l', 'j', 'k', '0', '$', '^', 'w', 'b', 'e' => self.handle_motion_key(buf, ch, 1),
                         else => {},
                     }
                 }
             },
-            .left, .right, .down, .up => self.handle_arrow_key(buf, ev.code, 1),
+            .left, .right, .down, .up => {
+                const count = self.count orelse 1;
+                self.handle_arrow_key(buf, ev.code, count);
+                self.count = null;
+            },
             else => {},
         }
     }
@@ -418,6 +513,12 @@ pub const EditorState = struct {
                 },
                 'b' => {
                     self.move_word_backward(buf);
+                },
+                'e' => {
+                    self.move_word_end(buf);
+                },
+                '^' => {
+                    self.move_first_non_blank(buf);
                 },
                 else => {},
             }
@@ -703,12 +804,24 @@ pub const EditorState = struct {
                             buf.begin_undo_group(self.cursor.line, self.cursor.col);
                             self.mode = .insert;
                         },
+                        'I' => {
+                            self.move_first_non_blank(buf);
+                            buf.begin_undo_group(self.cursor.line, self.cursor.col);
+                            self.mode = .insert;
+                        },
                         'a' => {
                             const len = get_line_len(buf, self.cursor.line);
                             if (self.cursor.col < len) {
                                 self.cursor.col += 1;
                             }
                             self.cursor.desired_col = self.cursor.col;
+                            buf.begin_undo_group(self.cursor.line, self.cursor.col);
+                            self.mode = .insert;
+                        },
+                        'A' => {
+                            const len = get_line_len(buf, self.cursor.line);
+                            self.cursor.col = len;
+                            self.cursor.desired_col = len;
                             buf.begin_undo_group(self.cursor.line, self.cursor.col);
                             self.mode = .insert;
                         },
@@ -722,6 +835,43 @@ pub const EditorState = struct {
                                 try buf.insert(buf.len(), "\n");
                             }
                             self.cursor.line += 1;
+                            self.cursor.col = 0;
+                            self.cursor.desired_col = 0;
+                            self.mode = .insert;
+                        },
+                        'O' => {
+                            buf.begin_undo_group(self.cursor.line, self.cursor.col);
+                            const line_start = buf.lines.get_line_start(self.cursor.line) orelse 0;
+                            try buf.insert(line_start, "\n");
+                            self.cursor.col = 0;
+                            self.cursor.desired_col = 0;
+                            self.mode = .insert;
+                        },
+                        'C' => {
+                            buf.begin_undo_group(self.cursor.line, self.cursor.col);
+                            const line_start = buf.lines.get_line_start(self.cursor.line) orelse 0;
+                            const line_len = get_line_len(buf, self.cursor.line);
+                            if (line_len > self.cursor.col) {
+                                try buf.delete(line_start + self.cursor.col, line_len - self.cursor.col);
+                            }
+                            self.mode = .insert;
+                        },
+                        's' => {
+                            const cur_len = get_line_len(buf, self.cursor.line);
+                            if (cur_len > 0 and self.cursor.col < cur_len) {
+                                buf.begin_undo_group(self.cursor.line, self.cursor.col);
+                                const line_start = buf.lines.get_line_start(self.cursor.line) orelse 0;
+                                try buf.delete(line_start + self.cursor.col, 1);
+                                self.mode = .insert;
+                            }
+                        },
+                        'S' => {
+                            buf.begin_undo_group(self.cursor.line, self.cursor.col);
+                            const line_start = buf.lines.get_line_start(self.cursor.line) orelse 0;
+                            const line_len = get_line_len(buf, self.cursor.line);
+                            if (line_len > 0) {
+                                try buf.delete(line_start, line_len);
+                            }
                             self.cursor.col = 0;
                             self.cursor.desired_col = 0;
                             self.mode = .insert;
@@ -765,7 +915,43 @@ pub const EditorState = struct {
                                 }
                             }
                         },
-                        'h', 'l', 'j', 'k', '0', '$', 'w', 'b' => self.handle_motion_key(buf, char, count),
+                        'h', 'l', 'j', 'k', '0', '$', '^', 'w', 'b', 'e' => self.handle_motion_key(buf, char, count),
+                        4 => { // Ctrl-D: half page down
+                            const stride = 15 * count;
+                            self.cursor.line = @min(self.cursor.line + stride, buf.line_count() - 1);
+                            const len = get_line_len(buf, self.cursor.line);
+                            const max_col = if (len > 0) len - 1 else 0;
+                            self.cursor.col = @min(self.cursor.desired_col, max_col);
+                        },
+                        21 => { // Ctrl-U: half page up
+                            const stride = 15 * count;
+                            if (self.cursor.line >= stride) {
+                                self.cursor.line -= stride;
+                            } else {
+                                self.cursor.line = 0;
+                            }
+                            const len = get_line_len(buf, self.cursor.line);
+                            const max_col = if (len > 0) len - 1 else 0;
+                            self.cursor.col = @min(self.cursor.desired_col, max_col);
+                        },
+                        6 => { // Ctrl-F: full page down
+                            const stride = 30 * count;
+                            self.cursor.line = @min(self.cursor.line + stride, buf.line_count() - 1);
+                            const len = get_line_len(buf, self.cursor.line);
+                            const max_col = if (len > 0) len - 1 else 0;
+                            self.cursor.col = @min(self.cursor.desired_col, max_col);
+                        },
+                        2 => { // Ctrl-B: full page up
+                            const stride = 30 * count;
+                            if (self.cursor.line >= stride) {
+                                self.cursor.line -= stride;
+                            } else {
+                                self.cursor.line = 0;
+                            }
+                            const len = get_line_len(buf, self.cursor.line);
+                            const max_col = if (len > 0) len - 1 else 0;
+                            self.cursor.col = @min(self.cursor.desired_col, max_col);
+                        },
                         'x' => {
                             var step: usize = 0;
                             while (step < count) : (step += 1) {
@@ -1726,4 +1912,147 @@ test "test_vim_search_history_cycling_and_live_preview" {
     try testing.expectEqualStrings("", state.get_cmd_line());
     try testing.expectEqual(@as(usize, 0), state.cursor.line);
     try testing.expectEqual(@as(usize, 0), state.cursor.col);
+}
+
+test "test_vim_shift_a_appends_end_of_line" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "hello world\nsecond line\n");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 2 } };
+    try state.handle_key(&buf, .{ .code = .character, .char = 'A' });
+
+    try testing.expectEqual(Mode.insert, state.mode);
+    try testing.expectEqual(@as(usize, 0), state.cursor.line);
+    try testing.expectEqual(@as(usize, 11), state.cursor.col);
+
+    try state.handle_key(&buf, .{ .code = .character, .char = '!' });
+    const slice = try buf.get_slice(testing.allocator, 0, 13);
+    defer testing.allocator.free(slice);
+    try testing.expectEqualStrings("hello world!\n", slice);
+}
+
+test "test_vim_shift_i_inserts_first_non_blank" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "   indented text\n");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 8 } };
+    try state.handle_key(&buf, .{ .code = .character, .char = 'I' });
+
+    try testing.expectEqual(Mode.insert, state.mode);
+    try testing.expectEqual(@as(usize, 0), state.cursor.line);
+    try testing.expectEqual(@as(usize, 3), state.cursor.col);
+}
+
+test "test_vim_shift_o_opens_line_above" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "first line\nsecond line");
+
+    var state = EditorState{ .cursor = .{ .line = 1, .col = 4 } };
+    try state.handle_key(&buf, .{ .code = .character, .char = 'O' });
+
+    try testing.expectEqual(Mode.insert, state.mode);
+    try testing.expectEqual(@as(usize, 1), state.cursor.line);
+    try testing.expectEqual(@as(usize, 0), state.cursor.col);
+    try testing.expectEqual(@as(usize, 3), buf.line_count());
+}
+
+test "test_vim_shift_c_changes_to_end_of_line" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "hello world\n");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 5 } };
+    try state.handle_key(&buf, .{ .code = .character, .char = 'C' });
+
+    try testing.expectEqual(Mode.insert, state.mode);
+    const line0 = (try buf.get_line(testing.allocator, 0)).?;
+    defer testing.allocator.free(line0);
+    try testing.expectEqualStrings("hello", line0);
+}
+
+test "test_vim_substitute_char_and_line" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "abcde\n12345\n");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 1 } };
+    try state.handle_key(&buf, .{ .code = .character, .char = 's' });
+    try testing.expectEqual(Mode.insert, state.mode);
+    try state.handle_key(&buf, .{ .code = .character, .char = 'X' });
+    try state.handle_key(&buf, .{ .code = .escape });
+
+    const l0 = (try buf.get_line(testing.allocator, 0)).?;
+    defer testing.allocator.free(l0);
+    try testing.expectEqualStrings("aXcde", l0);
+
+    state.cursor = .{ .line = 1, .col = 2 };
+    try state.handle_key(&buf, .{ .code = .character, .char = 'S' });
+    try testing.expectEqual(Mode.insert, state.mode);
+    const l1 = (try buf.get_line(testing.allocator, 1)).?;
+    defer testing.allocator.free(l1);
+    try testing.expectEqualStrings("", l1);
+}
+
+test "test_vim_caret_and_e_motions" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "   word1  word2 \n");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 8 } };
+    try state.handle_key(&buf, .{ .code = .character, .char = '^' });
+    try testing.expectEqual(@as(usize, 3), state.cursor.col);
+
+    state.cursor = .{ .line = 0, .col = 0 };
+    try state.handle_key(&buf, .{ .code = .character, .char = 'e' });
+    try testing.expectEqual(@as(usize, 7), state.cursor.col); // end of "word1"
+
+    try state.handle_key(&buf, .{ .code = .character, .char = 'e' });
+    try testing.expectEqual(@as(usize, 14), state.cursor.col); // end of "word2"
+}
+
+test "test_vim_ctrl_d_and_ctrl_u_scrolling" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        try buf.insert(buf.len(), "line\n");
+    }
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 0 } };
+    try state.handle_key(&buf, .{ .code = .character, .char = 4 }); // Ctrl-D
+    try testing.expectEqual(@as(usize, 15), state.cursor.line);
+
+    try state.handle_key(&buf, .{ .code = .character, .char = 4 }); // Ctrl-D
+    try testing.expectEqual(@as(usize, 30), state.cursor.line);
+
+    try state.handle_key(&buf, .{ .code = .character, .char = 21 }); // Ctrl-U
+    try testing.expectEqual(@as(usize, 15), state.cursor.line);
+}
+
+test "test_vim_visual_j_and_k_line_shift" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "line 1\nline 2\nline 3\nline 4\n");
+
+    var state = EditorState{ .cursor = .{ .line = 1, .col = 0 } };
+    try state.handle_key(&buf, .{ .code = .character, .char = 'V' });
+
+    // Move line 2 down below line 3 with 'J'
+    try state.handle_key(&buf, .{ .code = .character, .char = 'J' });
+    try testing.expectEqual(@as(usize, 2), state.cursor.line);
+
+    const full_text = try buf.get_slice(testing.allocator, 0, buf.len());
+    defer testing.allocator.free(full_text);
+    try testing.expectEqualStrings("line 1\nline 3\nline 2\nline 4\n", full_text);
+
+    // Move line 2 back up with 'K'
+    try state.handle_key(&buf, .{ .code = .character, .char = 'K' });
+    try testing.expectEqual(@as(usize, 1), state.cursor.line);
+
+    const full_text2 = try buf.get_slice(testing.allocator, 0, buf.len());
+    defer testing.allocator.free(full_text2);
+    try testing.expectEqualStrings("line 1\nline 2\nline 3\nline 4\n", full_text2);
 }

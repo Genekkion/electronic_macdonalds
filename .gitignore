@@ -7,3 +7,4 @@ research/
 /lua
 TEST_PLAN.md
 CHANGE_PLAN.md
+*.log

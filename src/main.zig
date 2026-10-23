@@ -343,7 +343,6 @@ fn getLineCountCallback(ctx: ?*anyopaque) callconv(.c) c_int {
 fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mods: c_int) callconv(.c) void {
     _ = ctx;
     const buf = g_active_buffer orelse return;
-    _ = mods;
 
     var ev = KeyEvent{ .code = .character };
     switch (key_code) {
@@ -353,8 +352,18 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         48 => ev.code = .tab,
         123 => ev.code = .left,
         124 => ev.code = .right,
-        125 => ev.code = .down,
-        126 => ev.code = .up,
+        125 => {
+            ev.code = .down;
+            if ((mods & 1) != 0) {
+                g_editor.count = 5;
+            }
+        },
+        126 => {
+            ev.code = .up;
+            if ((mods & 1) != 0) {
+                g_editor.count = 5;
+            }
+        },
         117 => ev.code = .delete,
         115 => ev.code = .home,
         119 => ev.code = .end,
