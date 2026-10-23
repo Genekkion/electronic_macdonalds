@@ -11,12 +11,22 @@ pub const Buffer = struct {
     gap_end: usize,
     markers: std.ArrayList(*Marker),
     lines: LineIndex,
+    is_dirty: bool = false,
 
     const default_capacity: usize = 64;
 
     pub const Error = error{
         OutOfBounds,
         OutOfMemory,
+    };
+
+    pub const FileError = error{
+        FileOpenFailed,
+        FileNotFound,
+        WriteFailed,
+        ReadFailed,
+        OutOfMemory,
+        OutOfBounds,
     };
 
     pub fn init(allocator: Allocator) Buffer {
@@ -31,6 +41,7 @@ pub const Buffer = struct {
             .gap_end = data.len,
             .markers = .empty,
             .lines = LineIndex.init(allocator),
+            .is_dirty = false,
         };
     }
 
@@ -119,6 +130,7 @@ pub const Buffer = struct {
         }
 
         try self.lines.on_insert(offset, bytes);
+        self.is_dirty = true;
     }
 
     pub fn delete(self: *Buffer, offset: usize, count_to_delete: usize) Error!void {
@@ -138,6 +150,7 @@ pub const Buffer = struct {
         }
 
         try self.lines.on_delete(offset, count_to_delete);
+        self.is_dirty = true;
     }
 
     pub fn get_slice(self: *const Buffer, allocator: Allocator, start: usize, end: usize) Error![]u8 {
@@ -198,6 +211,56 @@ pub const Buffer = struct {
                 return;
             }
         }
+    }
+
+    extern "c" fn fseek(stream: ?*anyopaque, offset: c_long, whence: c_int) c_int;
+    extern "c" fn ftell(stream: ?*anyopaque) c_long;
+
+    pub fn save_to_file(self: *Buffer, path: [:0]const u8) FileError!void {
+        const f = std.c.fopen(path.ptr, "wb") orelse return error.FileOpenFailed;
+        defer _ = std.c.fclose(f);
+
+        // Write pre-gap segment
+        if (self.gap_start > 0) {
+            const written = std.c.fwrite(self.data[0..self.gap_start].ptr, 1, self.gap_start, f);
+            if (written < self.gap_start) return error.WriteFailed;
+        }
+
+        // Write post-gap segment
+        const post_len = self.data.len - self.gap_end;
+        if (post_len > 0) {
+            const written = std.c.fwrite(self.data[self.gap_end..].ptr, 1, post_len, f);
+            if (written < post_len) return error.WriteFailed;
+        }
+
+        self.is_dirty = false;
+    }
+
+    pub fn load_from_file(allocator: Allocator, path: [:0]const u8) FileError!Buffer {
+        const f = std.c.fopen(path.ptr, "rb") orelse return error.FileNotFound;
+        defer _ = std.c.fclose(f);
+
+        _ = fseek(f, 0, 2); // SEEK_END
+        const size_long = ftell(f);
+        if (size_long < 0) return error.ReadFailed;
+        const file_size: usize = @intCast(size_long);
+        _ = fseek(f, 0, 0); // SEEK_SET
+
+        var buf = Buffer.init(allocator);
+        errdefer buf.deinit();
+
+        if (file_size > 0) {
+            const temp = allocator.alloc(u8, file_size) catch return error.OutOfMemory;
+            defer allocator.free(temp);
+
+            const read_bytes = std.c.fread(temp.ptr, 1, file_size, f);
+            if (read_bytes < file_size) return error.ReadFailed;
+
+            try buf.insert(0, temp[0..read_bytes]);
+        }
+
+        buf.is_dirty = false;
+        return buf;
     }
 };
 
@@ -358,4 +421,51 @@ test "test_buffer_zero_length_operations" {
     try buf.delete(1, 0);
 
     try testing.expectEqual(@as(usize, 3), buf.len());
+}
+
+test "test_buffer_dirty_flag_tracking" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+
+    try testing.expect(!buf.is_dirty);
+    try buf.insert(0, "hello");
+    try testing.expect(buf.is_dirty);
+}
+
+test "test_buffer_save_to_file" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+
+    try buf.insert(0, "hello world\nline two\n");
+    const test_path: [:0]const u8 = "/tmp/em_test_save.txt";
+    try buf.save_to_file(test_path);
+    defer _ = std.c.unlink(test_path.ptr);
+
+    try testing.expect(!buf.is_dirty);
+
+    var loaded = try Buffer.load_from_file(testing.allocator, test_path);
+    defer loaded.deinit();
+
+    const content = try loaded.get_slice(testing.allocator, 0, loaded.len());
+    defer testing.allocator.free(content);
+
+    try testing.expectEqualStrings("hello world\nline two\n", content);
+}
+
+test "test_buffer_load_from_file" {
+    const test_path: [:0]const u8 = "/tmp/em_test_load.txt";
+    const f = std.c.fopen(test_path.ptr, "wb") orelse return error.FileOpenFailed;
+    const test_data = "file content\nline two\nline three";
+    _ = std.c.fwrite(test_data.ptr, 1, test_data.len, f);
+    _ = std.c.fclose(f);
+    defer _ = std.c.unlink(test_path.ptr);
+
+    var buf = try Buffer.load_from_file(testing.allocator, test_path);
+    defer buf.deinit();
+
+    try testing.expect(!buf.is_dirty);
+    try testing.expectEqual(@as(usize, 3), buf.line_count());
+    const slice = try buf.get_slice(testing.allocator, 0, buf.len());
+    defer testing.allocator.free(slice);
+    try testing.expectEqualStrings("file content\nline two\nline three", slice);
 }

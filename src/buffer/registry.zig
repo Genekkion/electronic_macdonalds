@@ -35,6 +35,17 @@ pub const BufferRegistry = struct {
         return id;
     }
 
+    pub fn load_file(self: *BufferRegistry, path: [:0]const u8) !u64 {
+        const buf = try self.allocator.create(Buffer);
+        errdefer self.allocator.destroy(buf);
+        buf.* = try Buffer.load_from_file(self.allocator, path);
+
+        const id = self.next_id;
+        self.next_id += 1;
+        try self.buffers.put(id, buf);
+        return id;
+    }
+
     pub fn get(self: *BufferRegistry, id: u64) ?*Buffer {
         return self.buffers.get(id);
     }

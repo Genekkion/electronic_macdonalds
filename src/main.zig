@@ -13,6 +13,25 @@ var g_active_buffer: ?*root.Buffer = null;
 var g_editor = EditorState{};
 var g_window: ?*anyopaque = null;
 var g_line_buffer: [4096]u8 = undefined;
+var g_lua: ?*c.lua_State = null;
+var g_registry: ?*root.BufferRegistry = null;
+
+fn getLuaStatusMessage(allocator: std.mem.Allocator) ?[:0]u8 {
+    const L = g_lua orelse return null;
+    _ = c.lua_getglobal(L, "editor");
+    _ = c.lua_getfield(L, -1, "get_last_message");
+    if (c.lua_pcallk(L, 0, 1, 0, 0, null) == 0) {
+        var len: usize = 0;
+        const str = c.lua_tolstring(L, -1, &len);
+        if (str != null and len > 0) {
+            const res = allocator.dupeZ(u8, str[0..len]) catch null;
+            c.lua_pop(L, 2);
+            return res;
+        }
+    }
+    c.lua_pop(L, 2);
+    return null;
+}
 
 fn updateUi() void {
     const win = g_window orelse return;
@@ -40,39 +59,23 @@ fn updateUi() void {
         ) catch return;
         defer std.heap.c_allocator.free(status);
         macos.macos_window_set_status_line(win, status.ptr);
-    } else if (g_editor.last_cmd_len > 0) {
-        const last = g_editor.get_last_cmd();
-        const base_status = format_status_line(
-            std.heap.c_allocator,
-            g_editor.mode,
-            "main.lua",
-            g_editor.cursor.line,
-            g_editor.cursor.col,
-            buf.line_count(),
-        ) catch return;
-        defer std.heap.c_allocator.free(base_status);
-
-        const status_slice = std.fmt.allocPrint(
-            std.heap.c_allocator,
-            "{s}   [echo: {s}]",
-            .{ base_status, last },
-        ) catch return;
-        defer std.heap.c_allocator.free(status_slice);
-        const status_z = std.heap.c_allocator.dupeZ(u8, status_slice) catch return;
-        defer std.heap.c_allocator.free(status_z);
-
-        macos.macos_window_set_status_line(win, status_z.ptr);
     } else {
-        const status = format_status_line(
-            std.heap.c_allocator,
-            g_editor.mode,
-            "main.lua",
-            g_editor.cursor.line,
-            g_editor.cursor.col,
-            buf.line_count(),
-        ) catch return;
-        defer std.heap.c_allocator.free(status);
-        macos.macos_window_set_status_line(win, status.ptr);
+        const maybe_lua_msg = getLuaStatusMessage(std.heap.c_allocator);
+        if (maybe_lua_msg) |msg| {
+            defer std.heap.c_allocator.free(msg);
+            macos.macos_window_set_status_line(win, msg.ptr);
+        } else {
+            const status = format_status_line(
+                std.heap.c_allocator,
+                g_editor.mode,
+                "scratch.lua",
+                g_editor.cursor.line,
+                g_editor.cursor.col,
+                buf.line_count(),
+            ) catch return;
+            defer std.heap.c_allocator.free(status);
+            macos.macos_window_set_status_line(win, status.ptr);
+        }
     }
 }
 
@@ -123,7 +126,41 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         },
     }
 
+    const was_cmd = (g_editor.mode == .command_line);
+    var cmd_copy: [256]u8 = undefined;
+    var cmd_len: usize = 0;
+    if (was_cmd and ev.code == .enter) {
+        const raw_cmd = g_editor.get_cmd_line();
+        cmd_len = @min(raw_cmd.len, cmd_copy.len);
+        @memcpy(cmd_copy[0..cmd_len], raw_cmd[0..cmd_len]);
+    }
+
     g_editor.handle_key(buf, ev) catch {};
+
+    if (was_cmd and ev.code == .enter and g_lua != null) {
+        const L = g_lua.?;
+        _ = c.lua_getglobal(L, "editor");
+        _ = c.lua_getfield(L, -1, "dispatch_command");
+        _ = c.lua_pushlstring(L, cmd_copy[0..cmd_len].ptr, cmd_len);
+        if (c.lua_pcallk(L, 1, 1, 0, 0, null) == 0) {
+            c.lua_pop(L, 2);
+        } else {
+            c.lua_pop(L, 2);
+        }
+
+        if (root.lua.is_quit_requested()) {
+            std.c.exit(0);
+        }
+
+        if (root.lua.get_active_buffer_id()) |new_id| {
+            if (g_registry) |reg| {
+                if (reg.get(new_id)) |new_buf| {
+                    g_active_buffer = new_buf;
+                }
+            }
+        }
+    }
+
     updateUi();
 }
 
@@ -135,6 +172,7 @@ pub fn main() !void {
     // 1. Initialize Buffer Registry
     var registry = root.BufferRegistry.init(allocator);
     defer registry.deinit();
+    g_registry = &registry;
 
     const buf_id = try registry.create_buffer();
     const buf = registry.get(buf_id).?;
@@ -142,10 +180,15 @@ pub fn main() !void {
 
     // Populate initial interactive buffer text
     try buf.insert(0,
-        \\-- Welcome to Electronic Macdonalds (Native Zig + Lua Cocoa GUI)
+        \\-- Welcome to Electronic Macdonalds (Native Zig Core + Lua Engine)
         \\-- Vim modal keybindings active:
         \\--   Normal Mode: h/j/k/l, 0/$, w/b, x, dd, i, a, o
-        \\--   Insert Mode: typing, Enter, Backspace, Esc (returns to Normal)
+        \\--   Insert Mode: typing, Enter, Backspace, Esc
+        \\--   Command Mode (:):
+        \\--     :w [path]   (Save buffer to disk)
+        \\--     :q          (Quit editor, checks dirty flag)
+        \\--     :q!         (Force quit editor)
+        \\--     :echo <msg> (Echo message to status line)
         \\
         \\local function fibonacci(n)
         \\    if n <= 1 then return n end
@@ -162,6 +205,8 @@ pub fn main() !void {
     c.luaL_openlibs(L);
 
     root.lua.init_binding(L, &registry);
+    root.lua.set_active_buffer_id(buf_id);
+    g_lua = L;
 
     // 3. Initialize macOS Cocoa GUI
     if (!macos.macos_app_init()) return error.AppInitFailed;
@@ -179,6 +224,6 @@ pub fn main() !void {
     );
     updateUi();
 
-    std.debug.print("Window ready with Vim modal editing and dynamic status line.\n", .{});
+    std.debug.print("Window ready with Lua-powered Vim commands (:w, :q, :q!, :echo).\n", .{});
     macos.macos_app_run();
 }

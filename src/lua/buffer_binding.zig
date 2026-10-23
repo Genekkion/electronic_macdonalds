@@ -1,0 +1,662 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const c = @import("c.zig").c;
+const result = @import("result.zig");
+const Buffer = @import("../buffer/buffer.zig").Buffer;
+const BufferRegistry = @import("../buffer/registry.zig").BufferRegistry;
+
+pub const metatable_name = "ElectronicMacdonalds.BufferHandle";
+
+pub const BufferHandle = struct {
+    id: u64,
+};
+
+var global_registry: ?*BufferRegistry = null;
+
+const lua_editor_init = @embedFile("../runtime/lua/editor/init.lua");
+const lua_editor_commands = @embedFile("../runtime/lua/editor/commands.lua");
+
+pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
+    global_registry = registry;
+
+    // Create metatable for BufferHandle
+    _ = c.luaL_newmetatable(L, metatable_name);
+    c.lua_pushvalue(L, -1);
+    c.lua_setfield(L, -2, "__index");
+
+    const methods = [_]c.luaL_Reg{
+        .{ .name = "len", .func = lua_len },
+        .{ .name = "line_count", .func = lua_line_count },
+        .{ .name = "insert", .func = lua_insert },
+        .{ .name = "delete", .func = lua_delete },
+        .{ .name = "get_slice", .func = lua_get_slice },
+        .{ .name = "get_line", .func = lua_get_line },
+        .{ .name = "is_dirty", .func = lua_is_dirty },
+        .{ .name = "save", .func = lua_save },
+        .{ .name = null, .func = null },
+    };
+    c.luaL_setfuncs(L, &methods, 0);
+    c.lua_pop(L, 1);
+
+    // Register editor table
+    c.lua_newtable(L);
+
+    // Create internal keybindings table: editor._keybindings = {}
+    c.lua_newtable(L);
+    c.lua_setfield(L, -2, "_keybindings");
+
+    const editor_funcs = [_]c.luaL_Reg{
+        .{ .name = "create_buffer", .func = lua_create_buffer },
+        .{ .name = "close_buffer", .func = lua_close_buffer },
+        .{ .name = "read_file", .func = lua_read_file },
+        .{ .name = "quit", .func = lua_quit },
+        .{ .name = "is_quit_requested", .func = lua_is_quit_requested },
+        .{ .name = "get_current_buffer", .func = lua_get_current_buffer },
+        .{ .name = "set_current_buffer", .func = lua_set_current_buffer },
+        .{ .name = "bind_key", .func = lua_bind_key },
+        .{ .name = "dispatch_key_combo", .func = lua_dispatch_key_combo },
+        .{ .name = null, .func = null },
+    };
+    c.luaL_setfuncs(L, &editor_funcs, 0);
+    c.lua_setglobal(L, "editor");
+
+    // Register embedded modules into package.preload so `require` finds them
+    _ = c.lua_getglobal(L, "package");
+    _ = c.lua_getfield(L, -1, "preload");
+
+    _ = c.luaL_loadbufferx(L, lua_editor_commands.ptr, lua_editor_commands.len, "@editor.commands", null);
+    c.lua_setfield(L, -2, "editor.commands");
+
+    _ = c.luaL_loadbufferx(L, lua_editor_init.ptr, lua_editor_init.len, "@editor.init", null);
+    c.lua_setfield(L, -2, "editor.init");
+
+    c.lua_pop(L, 2); // pop preload, package
+
+    // Bootstrap editor runtime via editor.init
+    _ = c.luaL_loadbufferx(L, lua_editor_init.ptr, lua_editor_init.len, "@editor.init", null);
+    if (c.lua_pcallk(L, 0, 0, 0, 0, null) != 0) {
+        const err_msg = c.lua_tolstring(L, -1, null);
+        std.debug.print("Failed to initialize Lua runtime: {s}\n", .{err_msg});
+        c.lua_pop(L, 1);
+    }
+}
+
+fn lua_bind_key(L: ?*c.lua_State) callconv(.c) c_int {
+    if (c.lua_type(L, 1) != c.LUA_TSTRING or c.lua_type(L, 2) != c.LUA_TFUNCTION) {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected (combo: string, callback: function)");
+    }
+
+    _ = c.lua_getglobal(L, "editor");
+    _ = c.lua_getfield(L, -1, "_keybindings");
+
+    // keybindings[combo] = func
+    c.lua_pushvalue(L, 1);
+    c.lua_pushvalue(L, 2);
+    c.lua_settable(L, -3);
+
+    c.lua_pop(L, 2); // pop _keybindings, editor
+    return result.push_success_bool(L, true);
+}
+
+fn lua_dispatch_key_combo(L: ?*c.lua_State) callconv(.c) c_int {
+    if (c.lua_type(L, 1) != c.LUA_TSTRING) {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected (combo: string)");
+    }
+
+    _ = c.lua_getglobal(L, "editor");
+    _ = c.lua_getfield(L, -1, "_keybindings");
+
+    c.lua_pushvalue(L, 1);
+    _ = c.lua_gettable(L, -2);
+
+    if (c.lua_isfunction(L, -1)) {
+        if (c.lua_pcallk(L, 0, 0, 0, 0, null) != 0) {
+            c.lua_pop(L, 2); // pop error, editor
+            return result.push_error(L, "LUA_ERROR", "error executing key handler");
+        }
+        c.lua_pop(L, 2); // pop _keybindings, editor
+        return result.push_success_bool(L, true);
+    }
+
+    c.lua_pop(L, 3); // pop nil/value, _keybindings, editor
+    return result.push_error(L, "UNBOUND_KEY", "no binding for key combo");
+}
+
+fn get_handle_id(L: ?*c.lua_State, idx: c_int) ?u64 {
+    const udata = c.luaL_testudata(L, idx, metatable_name);
+    if (udata == null) return null;
+    const handle: *const BufferHandle = @ptrCast(@alignCast(udata));
+    return handle.id;
+}
+
+const GetBufResult = union(enum) {
+    buf: *Buffer,
+    err_ret: c_int,
+};
+
+fn resolve_buffer(L: ?*c.lua_State, idx: c_int) GetBufResult {
+    const id = get_handle_id(L, idx) orelse {
+        return .{ .err_ret = result.push_error(L, "INVALID_ARGUMENT", "expected BufferHandle") };
+    };
+    const registry = global_registry orelse {
+        return .{ .err_ret = result.push_error(L, "INTERNAL_ERROR", "registry not initialized") };
+    };
+    const buf = registry.get(id) orelse {
+        return .{ .err_ret = result.push_error(L, "INVALID_HANDLE", "buffer handle is invalid or closed") };
+    };
+    return .{ .buf = buf };
+}
+
+fn push_buffer_handle(L: ?*c.lua_State, id: u64) void {
+    const ptr = c.lua_newuserdatauv(L, @sizeOf(BufferHandle), 0);
+    const handle: *BufferHandle = @ptrCast(@alignCast(ptr));
+    handle.* = .{ .id = id };
+    _ = c.luaL_setmetatable(L, metatable_name);
+}
+
+fn lua_create_buffer(L: ?*c.lua_State) callconv(.c) c_int {
+    const registry = global_registry orelse {
+        return result.push_error(L, "INTERNAL_ERROR", "registry not initialized");
+    };
+    const id = registry.create_buffer() catch {
+        return result.push_error(L, "OUT_OF_MEMORY", "failed to allocate buffer");
+    };
+
+    push_buffer_handle(L, id);
+    c.lua_pushnil(L);
+    c.lua_pushnil(L);
+    return 3;
+}
+
+fn lua_read_file(L: ?*c.lua_State) callconv(.c) c_int {
+    var str_len: usize = 0;
+    const path_c = c.lua_tolstring(L, 1, &str_len);
+    if (path_c == null) {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected path string");
+    }
+    const path_slice = path_c[0..str_len];
+
+    const registry = global_registry orelse {
+        return result.push_error(L, "INTERNAL_ERROR", "registry not initialized");
+    };
+
+    const path_z = registry.allocator.dupeZ(u8, path_slice) catch {
+        return result.push_error(L, "OUT_OF_MEMORY", "failed to allocate path");
+    };
+    defer registry.allocator.free(path_z);
+
+    const id = registry.load_file(path_z) catch |err| switch (err) {
+        error.FileNotFound => return result.push_error(L, "FILE_NOT_FOUND", "file does not exist"),
+        error.FileOpenFailed => return result.push_error(L, "FILE_OPEN_FAILED", "could not open file"),
+        error.ReadFailed => return result.push_error(L, "READ_FAILED", "failed to read file content"),
+        error.WriteFailed => return result.push_error(L, "IO_ERROR", "io error"),
+        error.OutOfMemory => return result.push_error(L, "OUT_OF_MEMORY", "out of memory loading file"),
+        error.OutOfBounds => return result.push_error(L, "INTERNAL_ERROR", "buffer indexing error"),
+    };
+
+    push_buffer_handle(L, id);
+    c.lua_pushnil(L);
+    c.lua_pushnil(L);
+    return 3;
+}
+
+var g_quit_requested: bool = false;
+
+pub fn is_quit_requested() bool {
+    return g_quit_requested;
+}
+
+fn lua_quit(L: ?*c.lua_State) callconv(.c) c_int {
+    _ = L;
+    g_quit_requested = true;
+    return 0;
+}
+
+var current_buffer_id: ?u64 = null;
+
+pub fn get_active_buffer_id() ?u64 {
+    return current_buffer_id;
+}
+
+pub fn set_active_buffer_id(id: ?u64) void {
+    current_buffer_id = id;
+}
+
+fn lua_get_current_buffer(L: ?*c.lua_State) callconv(.c) c_int {
+    if (current_buffer_id) |id| {
+        push_buffer_handle(L, id);
+        c.lua_pushnil(L);
+        c.lua_pushnil(L);
+        return 3;
+    }
+    return result.push_success_nil(L);
+}
+
+fn lua_set_current_buffer(L: ?*c.lua_State) callconv(.c) c_int {
+    const id = get_handle_id(L, 1) orelse {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected BufferHandle");
+    };
+    current_buffer_id = id;
+    return result.push_success_bool(L, true);
+}
+
+fn lua_is_quit_requested(L: ?*c.lua_State) callconv(.c) c_int {
+    return result.push_success_bool(L, g_quit_requested);
+}
+
+fn lua_close_buffer(L: ?*c.lua_State) callconv(.c) c_int {
+    const id = get_handle_id(L, 1) orelse {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected BufferHandle");
+    };
+    const registry = global_registry orelse {
+        return result.push_error(L, "INTERNAL_ERROR", "registry not initialized");
+    };
+    if (registry.close_buffer(id)) {
+        return result.push_success_bool(L, true);
+    }
+    return result.push_error(L, "INVALID_HANDLE", "buffer handle not found or already closed");
+}
+
+fn lua_len(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| return result.push_success_int(L, @intCast(b.len())),
+    }
+}
+
+fn lua_line_count(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| return result.push_success_int(L, @intCast(b.line_count())),
+    }
+}
+
+fn lua_insert(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+
+    if (c.lua_isinteger(L, 2) == 0 or c.lua_type(L, 3) != c.LUA_TSTRING) {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected (offset: int, text: string)");
+    }
+
+    const offset_int = c.lua_tointegerx(L, 2, null);
+    if (offset_int < 0) {
+        return result.push_error(L, "OUT_OF_BOUNDS", "offset cannot be negative");
+    }
+    const offset: usize = @intCast(offset_int);
+
+    var str_len: usize = 0;
+    const str_ptr = c.lua_tolstring(L, 3, &str_len);
+    const text = str_ptr[0..str_len];
+
+    buf.insert(offset, text) catch |err| switch (err) {
+        error.OutOfBounds => return result.push_error(L, "OUT_OF_BOUNDS", "offset exceeds buffer length"),
+        error.OutOfMemory => return result.push_error(L, "OUT_OF_MEMORY", "failed to allocate memory"),
+    };
+
+    return result.push_success_bool(L, true);
+}
+
+fn lua_delete(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+
+    if (c.lua_isinteger(L, 2) == 0 or c.lua_isinteger(L, 3) == 0) {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected (offset: int, count: int)");
+    }
+
+    const offset_int = c.lua_tointegerx(L, 2, null);
+    const count_int = c.lua_tointegerx(L, 3, null);
+    if (offset_int < 0 or count_int < 0) {
+        return result.push_error(L, "OUT_OF_BOUNDS", "offset and count cannot be negative");
+    }
+    const offset: usize = @intCast(offset_int);
+    const count: usize = @intCast(count_int);
+
+    buf.delete(offset, count) catch |err| switch (err) {
+        error.OutOfBounds => return result.push_error(L, "OUT_OF_BOUNDS", "delete range exceeds buffer length"),
+        error.OutOfMemory => return result.push_error(L, "OUT_OF_MEMORY", "failed to allocate memory"),
+    };
+
+    return result.push_success_bool(L, true);
+}
+
+fn lua_get_slice(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+
+    if (c.lua_isinteger(L, 2) == 0 or c.lua_isinteger(L, 3) == 0) {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected (start: int, end: int)");
+    }
+
+    const start_int = c.lua_tointegerx(L, 2, null);
+    const end_int = c.lua_tointegerx(L, 3, null);
+    if (start_int < 0 or end_int < 0 or start_int > end_int) {
+        return result.push_error(L, "OUT_OF_BOUNDS", "invalid slice boundaries");
+    }
+    const start: usize = @intCast(start_int);
+    const end: usize = @intCast(end_int);
+
+    const registry = global_registry orelse {
+        return result.push_error(L, "INTERNAL_ERROR", "registry not initialized");
+    };
+
+    const slice = buf.get_slice(registry.allocator, start, end) catch |err| switch (err) {
+        error.OutOfBounds => return result.push_error(L, "OUT_OF_BOUNDS", "slice exceeds buffer length"),
+        error.OutOfMemory => return result.push_error(L, "OUT_OF_MEMORY", "failed to allocate memory"),
+    };
+    defer registry.allocator.free(slice);
+
+    return result.push_success_str(L, slice);
+}
+
+fn lua_get_line(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+
+    if (c.lua_isinteger(L, 2) == 0) {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected (line_idx: int)");
+    }
+
+    const line_idx_int = c.lua_tointegerx(L, 2, null);
+    if (line_idx_int < 0) {
+        return result.push_error(L, "OUT_OF_BOUNDS", "line index cannot be negative");
+    }
+    const line_idx: usize = @intCast(line_idx_int);
+    if (line_idx >= buf.line_count()) {
+        return result.push_error(L, "OUT_OF_BOUNDS", "line index exceeds line count");
+    }
+
+    const registry = global_registry orelse {
+        return result.push_error(L, "INTERNAL_ERROR", "registry not initialized");
+    };
+
+    const line_opt = buf.get_line(registry.allocator, line_idx) catch |err| switch (err) {
+        error.OutOfBounds => return result.push_error(L, "OUT_OF_BOUNDS", "line index out of bounds"),
+        error.OutOfMemory => return result.push_error(L, "OUT_OF_MEMORY", "failed to allocate memory"),
+    };
+
+    if (line_opt) |line| {
+        defer registry.allocator.free(line);
+        return result.push_success_str(L, line);
+    } else {
+        return result.push_error(L, "OUT_OF_BOUNDS", "line index out of bounds");
+    }
+}
+
+fn lua_is_dirty(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+    return result.push_success_bool(L, buf.is_dirty);
+}
+
+fn lua_save(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+
+    var str_len: usize = 0;
+    const path_c = c.lua_tolstring(L, 2, &str_len);
+    if (path_c == null) {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected path string");
+    }
+    const path_slice = path_c[0..str_len];
+    const registry = global_registry orelse return result.push_error(L, "INTERNAL_ERROR", "registry not initialized");
+
+    const path_z = registry.allocator.dupeZ(u8, path_slice) catch {
+        return result.push_error(L, "OUT_OF_MEMORY", "failed to allocate path");
+    };
+    defer registry.allocator.free(path_z);
+
+    buf.save_to_file(path_z) catch |err| switch (err) {
+        error.FileOpenFailed => return result.push_error(L, "FILE_OPEN_FAILED", "could not create or open file"),
+        error.WriteFailed => return result.push_error(L, "WRITE_FAILED", "failed to write to file"),
+        error.OutOfMemory => return result.push_error(L, "OUT_OF_MEMORY", "out of memory"),
+        else => return result.push_error(L, "IO_ERROR", "failed to save file"),
+    };
+
+    return result.push_success_bool(L, true);
+}
+
+// -----------------------------------------------------------------------------
+// Tests for Phase 2
+// -----------------------------------------------------------------------------
+const testing = std.testing;
+
+fn run_lua_test(code: [:0]const u8) !void {
+    const L = c.luaL_newstate();
+    if (L == null) return error.LuaInitFailed;
+    defer c.lua_close(L);
+    c.luaL_openlibs(L);
+
+    var registry = BufferRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    g_quit_requested = false;
+    current_buffer_id = null;
+    init_binding(L, &registry);
+
+    if (c.luaL_loadstring(L, code) != 0) {
+        const err_msg = c.lua_tolstring(L, -1, null);
+        std.debug.print("Lua Load Error: {s}\n", .{err_msg});
+        return error.LuaLoadError;
+    }
+
+    if (c.lua_pcallk(L, 0, 0, 0, 0, null) != 0) {
+        const err_msg = c.lua_tolstring(L, -1, null);
+        std.debug.print("Lua Runtime Error: {s}\n", .{err_msg});
+        return error.LuaRuntimeError;
+    }
+}
+
+test "test_lua_create_buffer" {
+    const script =
+        \\local buf, err, msg = editor.create_buffer()
+        \\assert(buf ~= nil and err == nil and msg == nil)
+        \\local len, err2, msg2 = buf:len()
+        \\assert(len == 0 and err2 == nil and msg2 == nil)
+        \\local lines, err3, msg3 = buf:line_count()
+        \\assert(lines == 1 and err3 == nil and msg3 == nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_invalid_handle_safety" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\local ok, err, msg = editor.close_buffer(buf)
+        \\assert(ok == true and err == nil and msg == nil)
+        \\local res, err2, msg2 = buf:len()
+        \\assert(res == nil)
+        \\assert(err2 == "INVALID_HANDLE")
+        \\assert(msg2 ~= nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_insert_and_slice" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\local ok, err, msg = buf:insert(0, "Hello, Lua!")
+        \\assert(ok == true and err == nil and msg == nil)
+        \\local slice, err2, msg2 = buf:get_slice(0, 5)
+        \\assert(slice == "Hello" and err2 == nil and msg2 == nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_multibyte_utf8" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\local ok, _, _ = buf:insert(0, "日本語 🚀")
+        \\assert(ok == true)
+        \\local total_len, _, _ = buf:len()
+        \\local slice, err, msg = buf:get_slice(0, total_len)
+        \\assert(slice == "日本語 🚀" and err == nil and msg == nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_delete" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\buf:insert(0, "abcdef")
+        \\local ok, err, msg = buf:delete(2, 2)
+        \\assert(ok == true and err == nil and msg == nil)
+        \\local total_len, _, _ = buf:len()
+        \\local slice, _, _ = buf:get_slice(0, total_len)
+        \\assert(slice == "abef")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_get_line" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\buf:insert(0, "alpha\nbeta\ngamma")
+        \\local line, err, msg = buf:get_line(1)
+        \\assert(line == "beta" and err == nil and msg == nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_get_invalid_line" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\local line, err, msg = buf:get_line(99)
+        \\assert(line == nil)
+        \\assert(err == "OUT_OF_BOUNDS")
+        \\assert(msg ~= nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_out_of_bounds_insert_error" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\local ok, err, msg = buf:insert(10, "fail")
+        \\assert(ok == nil)
+        \\assert(err == "OUT_OF_BOUNDS")
+        \\assert(msg ~= nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_out_of_bounds_delete_error" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\buf:insert(0, "abc")
+        \\local ok, err, msg = buf:delete(2, 5)
+        \\assert(ok == nil)
+        \\assert(err == "OUT_OF_BOUNDS")
+        \\assert(msg ~= nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_invalid_argument_types" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\local ok, err, msg = buf:insert("bad_offset", 123)
+        \\assert(ok == nil)
+        \\assert(err == "INVALID_ARGUMENT")
+        \\assert(msg ~= nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_bind_key_and_trigger" {
+    const script =
+        \\local triggered = false
+        \\editor.bind_key("<C-f>", function() triggered = true end)
+        \\editor.dispatch_key_combo("<C-f>")
+        \\assert(triggered == true)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_is_dirty" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\local dirty, _, _ = buf:is_dirty()
+        \\assert(dirty == false)
+        \\buf:insert(0, "edit")
+        \\local dirty_after, _, _ = buf:is_dirty()
+        \\assert(dirty_after == true)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_editor_read_write_file" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\buf:insert(0, "saved from lua")
+        \\local ok, err, msg = buf:save("/tmp/em_lua_save.txt")
+        \\assert(ok == true)
+        \\local is_d, _, _ = buf:is_dirty()
+        \\assert(is_d == false)
+        \\
+        \\local loaded, l_err, l_msg = editor.read_file("/tmp/em_lua_save.txt")
+        \\assert(loaded ~= nil)
+        \\local slice, _, _ = loaded:get_slice(0, 14)
+        \\assert(slice == "saved from lua")
+        \\os.remove("/tmp/em_lua_save.txt")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_command_registry_and_dispatch" {
+    const script =
+        \\local executed = false
+        \\editor.create_command("testcmd", function(args)
+        \\    assert(args == "hello world")
+        \\    executed = true
+        \\end)
+        \\local ok = editor.dispatch_command(":testcmd hello world")
+        \\assert(ok == true)
+        \\assert(executed == true)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_builtin_commands_write_and_quit" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\editor.set_current_buffer(buf)
+        \\buf:insert(0, "content")
+        \\
+        \\-- :q fails when buffer is dirty
+        \\editor.dispatch_command(":q")
+        \\assert(editor.get_last_error():find("No write since last change") ~= nil)
+        \\assert(editor.is_quit_requested() == false)
+        \\
+        \\-- :w writes and cleans dirty
+        \\editor.dispatch_command(":w /tmp/em_builtin_write.txt")
+        \\assert(buf:is_dirty() == false)
+        \\
+        \\-- :q now succeeds
+        \\editor.dispatch_command(":q")
+        \\assert(editor.is_quit_requested() == true)
+        \\os.remove("/tmp/em_builtin_write.txt")
+    ;
+    try run_lua_test(script);
+}

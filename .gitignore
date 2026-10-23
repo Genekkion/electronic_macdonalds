@@ -3,6 +3,6 @@
 .zig-cache/
 zig-out/
 research/
-lua
+/lua
 TEST_PLAN.md
 CHANGE_PLAN.md
