@@ -6,6 +6,8 @@ pub const Marker = buffer.Marker;
 pub const Buffer = buffer.Buffer;
 pub const LineIndex = buffer.LineIndex;
 pub const BufferRegistry = @import("buffer/registry.zig").BufferRegistry;
+pub const undo = @import("buffer/undo.zig");
+pub const undo_persist = @import("buffer/undo_persist.zig");
 
 pub const lua = @import("lua/buffer_binding.zig");
 pub const viewport = @import("render/viewport.zig");
@@ -31,4 +33,6 @@ test {
     _ = @import("input/mode.zig");
     _ = @import("input/vim.zig");
     _ = @import("platform/clipboard.zig");
+    _ = @import("buffer/undo.zig");
+    _ = @import("buffer/undo_persist.zig");
 }

@@ -370,6 +370,7 @@ pub const EditorState = struct {
             .character => {
                 if (ev.char) |char| switch (char) {
                     'i' => {
+                        buf.begin_undo_group(self.cursor.line, self.cursor.col);
                         self.mode = .insert;
                     },
                     'a' => {
@@ -378,9 +379,11 @@ pub const EditorState = struct {
                             self.cursor.col += 1;
                         }
                         self.cursor.desired_col = self.cursor.col;
+                        buf.begin_undo_group(self.cursor.line, self.cursor.col);
                         self.mode = .insert;
                     },
                     'o' => {
+                        buf.begin_undo_group(self.cursor.line, self.cursor.col);
                         if (self.cursor.line + 1 < buf.line_count()) {
                             const next_start = buf.lines.get_line_start(self.cursor.line + 1).?;
                             const insert_pos = if (next_start > 0) next_start - 1 else 0;
@@ -448,6 +451,20 @@ pub const EditorState = struct {
                     'd' => {
                         self.pending_cmd = 'd';
                     },
+                    'u' => {
+                        if (buf.undo()) |step| {
+                            self.cursor.line = step.cursor_line;
+                            self.cursor.col = step.cursor_col;
+                            self.cursor.desired_col = self.cursor.col;
+                        }
+                    },
+                    18 => { // Ctrl-R
+                        if (buf.redo()) |step| {
+                            self.cursor.line = step.cursor_line;
+                            self.cursor.col = step.cursor_col;
+                            self.cursor.desired_col = self.cursor.col;
+                        }
+                    },
                     ':' => {
                         self.mode = .command_line;
                         self.cmd_len = 0;
@@ -490,6 +507,7 @@ pub const EditorState = struct {
     fn handle_insert_key(self: *EditorState, buf: *Buffer, ev: KeyEvent) !void {
         switch (ev.code) {
             .escape => {
+                buf.end_undo_group();
                 self.mode = .normal;
                 if (self.cursor.col > 0) {
                     self.cursor.col -= 1;
@@ -908,4 +926,48 @@ test "test_clipboard_sync_on_normal_put" {
     const slice = try buf.get_slice(testing.allocator, 0, buf.len());
     defer testing.allocator.free(slice);
     try testing.expectEqualStrings("prefix from outside", slice);
+}
+
+test "test_vim_undo_coalescing_insert_mode" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 0 } };
+    try state.handle_key(&buf, .{ .code = .character, .char = 'i' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'h' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'e' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'l' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'l' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'o' });
+    try state.handle_key(&buf, .{ .code = .escape });
+
+    const slice = try buf.get_slice(testing.allocator, 0, buf.len());
+    defer testing.allocator.free(slice);
+    try testing.expectEqualStrings("hello", slice);
+
+    // Press 'u' in normal mode -> entire "hello" is undone at once
+    try state.handle_key(&buf, .{ .code = .character, .char = 'u' });
+    try testing.expectEqual(@as(usize, 0), buf.len());
+
+    // Press Ctrl-r (char code 18) -> "hello" restored
+    try state.handle_key(&buf, .{ .code = .character, .char = 18 });
+    const slice2 = try buf.get_slice(testing.allocator, 0, buf.len());
+    defer testing.allocator.free(slice2);
+    try testing.expectEqualStrings("hello", slice2);
+}
+
+test "test_vim_undo_resets_dirty_state" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    buf.mark_clean();
+
+    var state = EditorState{};
+    try state.handle_key(&buf, .{ .code = .character, .char = 'i' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'x' });
+    try state.handle_key(&buf, .{ .code = .escape });
+
+    try testing.expect(buf.is_dirty == true);
+
+    try state.handle_key(&buf, .{ .code = .character, .char = 'u' });
+    try testing.expect(buf.is_dirty == false);
 }

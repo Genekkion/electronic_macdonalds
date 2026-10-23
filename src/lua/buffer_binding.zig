@@ -5,6 +5,7 @@ const result = @import("result.zig");
 const Buffer = @import("../buffer/buffer.zig").Buffer;
 const BufferRegistry = @import("../buffer/registry.zig").BufferRegistry;
 const clipboard = @import("../platform/clipboard.zig");
+const undo_mod = @import("../buffer/undo.zig");
 
 pub const metatable_name = "ElectronicMacdonalds.BufferHandle";
 
@@ -60,6 +61,15 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
     };
     c.luaL_setfuncs(L, &clipboard_funcs, 0);
     c.lua_setfield(L, -2, "clipboard");
+
+    // Create undo table: editor.undo = { tree = ... }
+    c.lua_newtable(L);
+    const undo_funcs = [_]c.luaL_Reg{
+        .{ .name = "tree", .func = lua_undo_tree },
+        .{ .name = null, .func = null },
+    };
+    c.luaL_setfuncs(L, &undo_funcs, 0);
+    c.lua_setfield(L, -2, "undo");
 
     const editor_funcs = [_]c.luaL_Reg{
         .{ .name = "create_buffer", .func = lua_create_buffer },
@@ -163,6 +173,87 @@ fn lua_clipboard_set(L: ?*c.lua_State) callconv(.c) c_int {
         return result.push_success_bool(L, true);
     }
     return result.push_error(L, "INVALID_ARGUMENT", "expected (text: string)");
+}
+
+fn lua_undo_tree(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+
+    c.lua_createtable(L, 0, 4);
+
+    _ = c.lua_pushinteger(L, @intCast(buf.undo_tree.current.seq));
+    c.lua_setfield(L, -2, "seq_cur");
+
+    _ = c.lua_pushinteger(L, @intCast(if (buf.undo_tree.next_seq > 0) buf.undo_tree.next_seq - 1 else 0));
+    c.lua_setfield(L, -2, "seq_last");
+
+    if (buf.undo_tree.saved_seq) |s| {
+        _ = c.lua_pushinteger(L, @intCast(s));
+    } else {
+        c.lua_pushnil(L);
+    }
+    c.lua_setfield(L, -2, "save_cur");
+
+    const count = buf.undo_tree.all_nodes.count();
+    const entries = std.heap.c_allocator.alloc(*undo_mod.UndoNode, count) catch return result.push_error(L, "OUT_OF_MEMORY", "failed to allocate entries");
+    defer std.heap.c_allocator.free(entries);
+
+    var it = buf.undo_tree.all_nodes.valueIterator();
+    var i: usize = 0;
+    while (it.next()) |node_ptr| {
+        entries[i] = node_ptr.*;
+        i += 1;
+    }
+
+    const sortFn = struct {
+        fn lessThan(_: void, a: *undo_mod.UndoNode, b: *undo_mod.UndoNode) bool {
+            return a.seq < b.seq;
+        }
+    }.lessThan;
+    std.mem.sort(*undo_mod.UndoNode, entries, {}, sortFn);
+
+    c.lua_createtable(L, @intCast(count), 0);
+    var entry_idx: c_int = 1;
+    for (entries) |node| {
+        if (node.seq == 0) continue;
+
+        c.lua_createtable(L, 0, 6);
+
+        _ = c.lua_pushinteger(L, @intCast(node.seq));
+        c.lua_setfield(L, -2, "seq");
+
+        _ = c.lua_pushinteger(L, @intCast(node.timestamp));
+        c.lua_setfield(L, -2, "time");
+
+        if (node.parent) |p| {
+            _ = c.lua_pushinteger(L, @intCast(p.seq));
+        } else {
+            _ = c.lua_pushinteger(L, 0);
+        }
+        c.lua_setfield(L, -2, "parent");
+
+        _ = c.lua_pushinteger(L, @intCast(node.cursor_line));
+        c.lua_setfield(L, -2, "cursor_line");
+
+        _ = c.lua_pushinteger(L, @intCast(node.cursor_col));
+        c.lua_setfield(L, -2, "cursor_col");
+
+        c.lua_createtable(L, @intCast(node.children.items.len), 0);
+        for (node.children.items, 0..) |child, c_idx| {
+            _ = c.lua_pushinteger(L, @intCast(child.seq));
+            c.lua_rawseti(L, -2, @intCast(c_idx + 1));
+        }
+        c.lua_setfield(L, -2, "children");
+
+        c.lua_rawseti(L, -2, entry_idx);
+        entry_idx += 1;
+    }
+    c.lua_setfield(L, -2, "entries");
+
+    return 1;
 }
 
 fn get_handle_id(L: ?*c.lua_State, idx: c_int) ?u64 {
@@ -819,6 +910,46 @@ test "test_lua_builtin_commands_write_and_quit" {
     try run_lua_test(script);
 }
 
+test "test_lua_write_with_and_without_filepath" {
+    const script =
+        \\local path = "/tmp/em_test_w_path.txt"
+        \\local buf, _, _ = editor.create_buffer()
+        \\editor.set_current_buffer(buf)
+        \\buf:insert(0, "first version")
+        \\
+        \\-- :w without path fails initially on untitled buffer
+        \\local ok1 = editor.dispatch_command(":w")
+        \\assert(ok1 == true)
+        \\assert(editor.get_last_error() == "No file name")
+        \\assert(buf:is_dirty() == true)
+        \\
+        \\-- :w with explicit filepath succeeds and sets buffer path
+        \\local ok2 = editor.dispatch_command(":w " .. path)
+        \\assert(ok2 == true)
+        \\assert(editor.get_last_error() == "")
+        \\assert(buf:is_dirty() == false)
+        \\assert(buf:get_path() == path)
+        \\
+        \\-- make another edit
+        \\buf:insert(13, " modified")
+        \\assert(buf:is_dirty() == true)
+        \\
+        \\-- :w without path now succeeds using the established filepath
+        \\local ok3 = editor.dispatch_command(":w")
+        \\assert(ok3 == true)
+        \\assert(editor.get_last_error() == "")
+        \\assert(buf:is_dirty() == false)
+        \\
+        \\-- verify file content on disk
+        \\local loaded, _, _ = editor.read_file(path)
+        \\assert(loaded ~= nil)
+        \\local content, _, _ = loaded:get_slice(0, loaded:len())
+        \\assert(content == "first version modified")
+        \\os.remove(path)
+    ;
+    try run_lua_test(script);
+}
+
 test "test_lua_keymap_set_and_lookup" {
     const script =
         \\local called = false
@@ -997,6 +1128,44 @@ test "test_lua_buffer_delete_last_spawns_scratch" {
         \\assert(cur ~= nil)
         \\assert(cur:is_dirty() == false)
         \\assert(cur:len() == 0)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_undo_tree_query" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\editor.set_current_buffer(buf)
+        \\buf:insert(0, "first")
+        \\buf:insert(5, " second")
+        \\
+        \\local tree = editor.undo.tree(buf)
+        \\assert(tree ~= nil)
+        \\assert(tree.seq_cur == 2)
+        \\assert(tree.seq_last == 2)
+        \\assert(#tree.entries >= 2)
+        \\assert(tree.entries[1].seq == 1)
+        \\assert(tree.entries[2].seq == 2)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_undo_persistence_roundtrip" {
+    const script =
+        \\local test_file = "/tmp/em_lua_undo_persist.txt"
+        \\local b1, _, _ = editor.create_buffer()
+        \\b1:insert(0, "first modification\n")
+        \\b1:insert(19, "second modification\n")
+        \\local ok, err, msg = b1:save(test_file)
+        \\assert(ok == true)
+        \\
+        \\local b2, err2, msg2 = editor.read_file(test_file)
+        \\assert(b2 ~= nil)
+        \\local tree = editor.undo.tree(b2)
+        \\assert(tree ~= nil)
+        \\assert(tree.seq_cur == 2)
+        \\assert(#tree.entries >= 2)
+        \\os.remove(test_file)
     ;
     try run_lua_test(script);
 }

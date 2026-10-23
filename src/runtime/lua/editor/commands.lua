@@ -62,8 +62,8 @@ editor.create_command("w", function(args)
     end
 
     local path = args
-    if path == "" then
-        path = cur_buf.filename or ""
+    if not path or path == "" then
+        path = (cur_buf.get_path and cur_buf:get_path()) or ""
     end
 
     if path == "" then
@@ -73,7 +73,6 @@ editor.create_command("w", function(args)
 
     local ok, err, msg = cur_buf:save(path)
     if ok then
-        cur_buf.filename = path
         editor.set_status('"' .. path .. '" written')
     else
         editor.set_error("Write error: " .. tostring(msg or err))
@@ -103,8 +102,8 @@ editor.create_command("wq", function(args)
     local cur_buf = editor.get_current_buffer()
     if cur_buf then
         local path = args
-        if path == "" then
-            path = cur_buf.filename or ""
+        if not path or path == "" then
+            path = (cur_buf.get_path and cur_buf:get_path()) or ""
         end
         if path == "" then
             editor.set_error("No file name")
@@ -128,7 +127,6 @@ editor.create_command("e", function(path)
 
     local buf, err, msg = editor.read_file(path)
     if buf then
-        buf.filename = path
         editor.set_current_buffer(buf)
         editor.set_status('"' .. path .. '" opened')
     else

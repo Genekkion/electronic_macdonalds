@@ -3,6 +3,8 @@ const Allocator = std.mem.Allocator;
 
 pub const Marker = @import("marker.zig").Marker;
 pub const LineIndex = @import("line_index.zig").LineIndex;
+pub const undo_mod = @import("undo.zig");
+pub const undo_persist_mod = @import("undo_persist.zig");
 
 pub const Buffer = struct {
     allocator: Allocator,
@@ -14,6 +16,13 @@ pub const Buffer = struct {
     is_dirty: bool = false,
     file_path: ?[:0]const u8 = null,
     name: ?[]const u8 = null,
+    undo_tree: undo_mod.UndoTree,
+    group_active: bool = false,
+    group_offset: usize = 0,
+    group_inserted: std.ArrayList(u8),
+    group_deleted: std.ArrayList(u8),
+    group_line: usize = 0,
+    group_col: usize = 0,
 
     const default_capacity: usize = 64;
 
@@ -36,6 +45,7 @@ pub const Buffer = struct {
             var empty: [0]u8 = undefined;
             break :blk &empty;
         };
+        const u_tree = undo_mod.UndoTree.init(allocator) catch @panic("Failed to allocate undo tree");
         return .{
             .allocator = allocator,
             .data = data,
@@ -44,6 +54,9 @@ pub const Buffer = struct {
             .markers = .empty,
             .lines = LineIndex.init(allocator),
             .is_dirty = false,
+            .undo_tree = u_tree,
+            .group_inserted = .empty,
+            .group_deleted = .empty,
         };
     }
 
@@ -59,6 +72,9 @@ pub const Buffer = struct {
         }
         self.markers.deinit(self.allocator);
         self.lines.deinit();
+        self.undo_tree.deinit();
+        self.group_inserted.deinit(self.allocator);
+        self.group_deleted.deinit(self.allocator);
     }
 
     pub fn len(self: *const Buffer) usize {
@@ -121,7 +137,7 @@ pub const Buffer = struct {
         self.gap_end = new_gap_end;
     }
 
-    pub fn insert(self: *Buffer, offset: usize, bytes: []const u8) Error!void {
+    pub fn insert_raw(self: *Buffer, offset: usize, bytes: []const u8) Error!void {
         if (offset > self.len()) return error.OutOfBounds;
         if (bytes.len == 0) return;
 
@@ -138,10 +154,23 @@ pub const Buffer = struct {
         }
 
         try self.lines.on_insert(offset, bytes);
-        self.is_dirty = true;
     }
 
-    pub fn delete(self: *Buffer, offset: usize, count_to_delete: usize) Error!void {
+    pub fn insert(self: *Buffer, offset: usize, bytes: []const u8) Error!void {
+        try self.insert_raw(offset, bytes);
+
+        if (self.group_active) {
+            if (self.group_inserted.items.len == 0) {
+                self.group_offset = offset;
+            }
+            try self.group_inserted.appendSlice(self.allocator, bytes);
+        } else {
+            _ = self.undo_tree.add_change(offset, bytes, "", 0, 0) catch {};
+        }
+        self.is_dirty = !self.undo_tree.is_at_save_point();
+    }
+
+    pub fn delete_raw(self: *Buffer, offset: usize, count_to_delete: usize) Error!void {
         if (offset > self.len()) return error.OutOfBounds;
         if (offset + count_to_delete > self.len()) return error.OutOfBounds;
         if (count_to_delete == 0) return;
@@ -158,7 +187,79 @@ pub const Buffer = struct {
         }
 
         try self.lines.on_delete(offset, count_to_delete);
-        self.is_dirty = true;
+    }
+
+    pub fn delete(self: *Buffer, offset: usize, count_to_delete: usize) Error!void {
+        if (offset > self.len() or offset + count_to_delete > self.len()) return error.OutOfBounds;
+        if (count_to_delete == 0) return;
+
+        const del_slice = try self.get_slice(self.allocator, offset, offset + count_to_delete);
+        defer self.allocator.free(del_slice);
+
+        try self.delete_raw(offset, count_to_delete);
+
+        if (self.group_active) {
+            try self.group_deleted.appendSlice(self.allocator, del_slice);
+        } else {
+            _ = self.undo_tree.add_change(offset, "", del_slice, 0, 0) catch {};
+        }
+        self.is_dirty = !self.undo_tree.is_at_save_point();
+    }
+
+    pub fn begin_undo_group(self: *Buffer, cursor_line: usize, cursor_col: usize) void {
+        self.group_active = true;
+        self.group_inserted.clearRetainingCapacity();
+        self.group_deleted.clearRetainingCapacity();
+        self.group_line = cursor_line;
+        self.group_col = cursor_col;
+    }
+
+    pub fn end_undo_group(self: *Buffer) void {
+        if (!self.group_active) return;
+        self.group_active = false;
+        if (self.group_inserted.items.len > 0 or self.group_deleted.items.len > 0) {
+            _ = self.undo_tree.add_change(
+                self.group_offset,
+                self.group_inserted.items,
+                self.group_deleted.items,
+                self.group_line,
+                self.group_col,
+            ) catch {};
+            self.is_dirty = !self.undo_tree.is_at_save_point();
+        }
+    }
+
+    pub fn mark_clean(self: *Buffer) void {
+        self.undo_tree.mark_saved();
+        self.is_dirty = false;
+    }
+
+    pub fn undo(self: *Buffer) ?undo_mod.UndoTree.StepAction {
+        if (self.undo_tree.undo()) |step| {
+            if (step.delete_len > 0) {
+                self.delete_raw(step.offset, step.delete_len) catch {};
+            }
+            if (step.insert_text.len > 0) {
+                self.insert_raw(step.offset, step.insert_text) catch {};
+            }
+            self.is_dirty = !self.undo_tree.is_at_save_point();
+            return step;
+        }
+        return null;
+    }
+
+    pub fn redo(self: *Buffer) ?undo_mod.UndoTree.StepAction {
+        if (self.undo_tree.redo()) |step| {
+            if (step.delete_len > 0) {
+                self.delete_raw(step.offset, step.delete_len) catch {};
+            }
+            if (step.insert_text.len > 0) {
+                self.insert_raw(step.offset, step.insert_text) catch {};
+            }
+            self.is_dirty = !self.undo_tree.is_at_save_point();
+            return step;
+        }
+        return null;
     }
 
     pub fn get_slice(self: *const Buffer, allocator: Allocator, start: usize, end: usize) Error![]u8 {
@@ -246,6 +347,17 @@ pub const Buffer = struct {
         }
         self.file_path = self.allocator.dupeZ(u8, path) catch null;
         self.is_dirty = false;
+        self.undo_tree.mark_saved();
+
+        // Persist undo history
+        if (undo_persist_mod.get_undo_path_for_file(self.allocator, path)) |undo_path| {
+            defer self.allocator.free(undo_path);
+            const content = self.get_slice(self.allocator, 0, self.len()) catch null;
+            if (content) |bytes| {
+                defer self.allocator.free(bytes);
+                undo_persist_mod.save_undo_file(&self.undo_tree, bytes, undo_path, self.allocator) catch {};
+            }
+        } else |_| {}
     }
 
     pub fn load_from_file(allocator: Allocator, path: [:0]const u8) FileError!Buffer {
@@ -268,11 +380,23 @@ pub const Buffer = struct {
             const read_bytes = std.c.fread(temp.ptr, 1, file_size, f);
             if (read_bytes < file_size) return error.ReadFailed;
 
-            try buf.insert(0, temp[0..read_bytes]);
+            try buf.insert_raw(0, temp[0..read_bytes]);
         }
 
         buf.file_path = allocator.dupeZ(u8, path) catch null;
         buf.is_dirty = false;
+        buf.undo_tree.mark_saved();
+
+        // Restore undo history if available and matches content
+        if (undo_persist_mod.get_undo_path_for_file(allocator, path)) |undo_path| {
+            defer allocator.free(undo_path);
+            const content = buf.get_slice(allocator, 0, buf.len()) catch null;
+            if (content) |bytes| {
+                defer allocator.free(bytes);
+                undo_persist_mod.load_undo_file(&buf.undo_tree, bytes, undo_path, allocator) catch {};
+            }
+        } else |_| {}
+
         return buf;
     }
 };
@@ -481,4 +605,50 @@ test "test_buffer_load_from_file" {
     const slice = try buf.get_slice(testing.allocator, 0, buf.len());
     defer testing.allocator.free(slice);
     try testing.expectEqualStrings("file content\nline two\nline three", slice);
+}
+
+test "test_buffer_save_and_load_restores_undo_history" {
+    const test_path: [:0]const u8 = "/tmp/em_persist_test.txt";
+    defer _ = std.c.unlink(test_path.ptr);
+
+    const undo_path = try undo_persist_mod.get_undo_path_for_file(testing.allocator, test_path);
+    defer testing.allocator.free(undo_path);
+    defer _ = std.c.unlink(undo_path.ptr);
+
+    {
+        var buf1 = Buffer.init(testing.allocator);
+        defer buf1.deinit();
+
+        try buf1.insert(0, "line one\n");
+        try buf1.insert(9, "line two\n");
+        try buf1.save_to_file(test_path);
+    }
+
+    // Verify file on disk
+    {
+        var buf2 = try Buffer.load_from_file(testing.allocator, test_path);
+        defer buf2.deinit();
+
+        const content = try buf2.get_slice(testing.allocator, 0, buf2.len());
+        defer testing.allocator.free(content);
+        try testing.expectEqualStrings("line one\nline two\n", content);
+
+        // Undo should restore previous state ("line one\n")
+        const undo_step = buf2.undo();
+        try testing.expect(undo_step != null);
+
+        const undo_content = try buf2.get_slice(testing.allocator, 0, buf2.len());
+        defer testing.allocator.free(undo_content);
+        try testing.expectEqualStrings("line one\n", undo_content);
+        try testing.expect(buf2.is_dirty);
+
+        // Redo should restore saved state
+        const redo_step = buf2.redo();
+        try testing.expect(redo_step != null);
+
+        const redo_content = try buf2.get_slice(testing.allocator, 0, buf2.len());
+        defer testing.allocator.free(redo_content);
+        try testing.expectEqualStrings("line one\nline two\n", redo_content);
+        try testing.expect(!buf2.is_dirty);
+    }
 }
