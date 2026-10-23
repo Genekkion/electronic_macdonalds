@@ -186,14 +186,15 @@ fn updateUi() void {
                 defer std.heap.c_allocator.free(msg);
                 macos.macos_window_set_status_line(win, msg.ptr);
             } else {
-                const status = format_status_line(
-                    std.heap.c_allocator,
-                    g_editor.mode,
-                    "scratch.lua",
-                    g_editor.cursor.line,
-                    g_editor.cursor.col,
-                    buf.line_count(),
-                ) catch return;
+            const buf_name = if (buf.file_path) |p| std.fs.path.basename(p) else (if (buf.name) |n| n else "scratch.lua");
+            const status = format_status_line(
+                std.heap.c_allocator,
+                g_editor.mode,
+                buf_name,
+                g_editor.cursor.line,
+                g_editor.cursor.col,
+                buf.line_count(),
+            ) catch return;
                 defer std.heap.c_allocator.free(status);
                 macos.macos_window_set_status_line(win, status.ptr);
             }
@@ -263,7 +264,10 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
                 if (root.lua.get_active_buffer_id()) |new_id| {
                     if (g_registry) |reg| {
                         if (reg.get(new_id)) |new_buf| {
-                            g_active_buffer = new_buf;
+                            if (g_active_buffer != new_buf) {
+                                g_active_buffer = new_buf;
+                                g_editor.cursor = .{};
+                            }
                         }
                     }
                 }
@@ -307,7 +311,10 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         if (root.lua.get_active_buffer_id()) |new_id| {
             if (g_registry) |reg| {
                 if (reg.get(new_id)) |new_buf| {
-                    g_active_buffer = new_buf;
+                    if (g_active_buffer != new_buf) {
+                        g_active_buffer = new_buf;
+                        g_editor.cursor = .{};
+                    }
                 }
             }
         }
@@ -339,8 +346,13 @@ pub fn main() !void {
         \\-- Vim modal keybindings active:
         \\--   Normal Mode: h/j/k/l, 0/$, w/b, x, dd, i, a, o, p/P
         \\--   Visual Mode: v (char-wise), V (line-wise), y (yank), d (delete)
-        \\--   Leader Maps: <Space>w (Save), <Space>q (Quit)
-        \\--   Command Mode (:):
+        \\--   Leader Maps: <Space>w (Save), <Space>q (Quit), <Space>bn/:bp
+        \\--   Buffers:
+        \\--     :ls / :buffers  (List active buffers)
+        \\--     :bn / :bp       (Next / Prev buffer)
+        \\--     :b <id_or_name> (Switch to buffer)
+        \\--     :bd / :bd!      (Delete buffer)
+        \\--   Commands:
         \\--     :w [path]   (Save buffer to disk)
         \\--     :q          (Quit editor, checks dirty flag)
         \\--     :q!         (Force quit editor)

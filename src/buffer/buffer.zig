@@ -12,6 +12,8 @@ pub const Buffer = struct {
     markers: std.ArrayList(*Marker),
     lines: LineIndex,
     is_dirty: bool = false,
+    file_path: ?[:0]const u8 = null,
+    name: ?[]const u8 = null,
 
     const default_capacity: usize = 64;
 
@@ -48,6 +50,12 @@ pub const Buffer = struct {
     pub fn deinit(self: *Buffer) void {
         if (self.data.len > 0) {
             self.allocator.free(self.data);
+        }
+        if (self.file_path) |p| {
+            self.allocator.free(p);
+        }
+        if (self.name) |n| {
+            self.allocator.free(n);
         }
         self.markers.deinit(self.allocator);
         self.lines.deinit();
@@ -233,6 +241,10 @@ pub const Buffer = struct {
             if (written < post_len) return error.WriteFailed;
         }
 
+        if (self.file_path) |old_p| {
+            self.allocator.free(old_p);
+        }
+        self.file_path = self.allocator.dupeZ(u8, path) catch null;
         self.is_dirty = false;
     }
 
@@ -259,6 +271,7 @@ pub const Buffer = struct {
             try buf.insert(0, temp[0..read_bytes]);
         }
 
+        buf.file_path = allocator.dupeZ(u8, path) catch null;
         buf.is_dirty = false;
         return buf;
     }

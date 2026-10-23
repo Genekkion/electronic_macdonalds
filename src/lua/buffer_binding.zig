@@ -17,6 +17,7 @@ var global_registry: ?*BufferRegistry = null;
 const lua_editor_init = @embedFile("../runtime/lua/editor/init.lua");
 const lua_editor_commands = @embedFile("../runtime/lua/editor/commands.lua");
 const lua_editor_keymap = @embedFile("../runtime/lua/editor/keymap.lua");
+const lua_editor_buffers = @embedFile("../runtime/lua/editor/buffers.lua");
 
 pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
     global_registry = registry;
@@ -35,6 +36,9 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
         .{ .name = "get_line", .func = lua_get_line },
         .{ .name = "is_dirty", .func = lua_is_dirty },
         .{ .name = "save", .func = lua_save },
+        .{ .name = "get_id", .func = lua_get_id },
+        .{ .name = "get_name", .func = lua_get_name },
+        .{ .name = "get_path", .func = lua_get_path },
         .{ .name = null, .func = null },
     };
     c.luaL_setfuncs(L, &methods, 0);
@@ -65,6 +69,8 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
         .{ .name = "is_quit_requested", .func = lua_is_quit_requested },
         .{ .name = "get_current_buffer", .func = lua_get_current_buffer },
         .{ .name = "set_current_buffer", .func = lua_set_current_buffer },
+        .{ .name = "list_buffers", .func = lua_list_buffers },
+        .{ .name = "get_buffer_by_id", .func = lua_get_buffer_by_id },
         .{ .name = "bind_key", .func = lua_bind_key },
         .{ .name = "dispatch_key_combo", .func = lua_dispatch_key_combo },
         .{ .name = null, .func = null },
@@ -81,6 +87,9 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
 
     _ = c.luaL_loadbufferx(L, lua_editor_keymap.ptr, lua_editor_keymap.len, "@editor.keymap", null);
     c.lua_setfield(L, -2, "editor.keymap");
+
+    _ = c.luaL_loadbufferx(L, lua_editor_buffers.ptr, lua_editor_buffers.len, "@editor.buffers", null);
+    c.lua_setfield(L, -2, "editor.buffers");
 
     _ = c.luaL_loadbufferx(L, lua_editor_init.ptr, lua_editor_init.len, "@editor.init", null);
     c.lua_setfield(L, -2, "editor.init");
@@ -258,18 +267,30 @@ pub fn set_active_buffer_id(id: ?u64) void {
 
 fn lua_get_current_buffer(L: ?*c.lua_State) callconv(.c) c_int {
     if (current_buffer_id) |id| {
-        push_buffer_handle(L, id);
-        c.lua_pushnil(L);
-        c.lua_pushnil(L);
-        return 3;
+        if (global_registry) |reg| {
+            if (reg.get(id) != null) {
+                push_buffer_handle(L, id);
+                c.lua_pushnil(L);
+                c.lua_pushnil(L);
+                return 3;
+            }
+        }
     }
-    return result.push_success_nil(L);
+    c.lua_pushnil(L);
+    c.lua_pushnil(L);
+    c.lua_pushnil(L);
+    return 3;
 }
 
 fn lua_set_current_buffer(L: ?*c.lua_State) callconv(.c) c_int {
-    const id = get_handle_id(L, 1) orelse {
-        return result.push_error(L, "INVALID_ARGUMENT", "expected BufferHandle");
-    };
+    var id: u64 = 0;
+    if (get_handle_id(L, 1)) |hid| {
+        id = hid;
+    } else if (c.lua_type(L, 1) == c.LUA_TNUMBER) {
+        id = @intCast(c.lua_tointegerx(L, 1, null));
+    } else {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected BufferHandle or buffer id number");
+    }
     current_buffer_id = id;
     return result.push_success_bool(L, true);
 }
@@ -279,16 +300,119 @@ fn lua_is_quit_requested(L: ?*c.lua_State) callconv(.c) c_int {
 }
 
 fn lua_close_buffer(L: ?*c.lua_State) callconv(.c) c_int {
-    const id = get_handle_id(L, 1) orelse {
-        return result.push_error(L, "INVALID_ARGUMENT", "expected BufferHandle");
-    };
+    var id: u64 = 0;
+    if (get_handle_id(L, 1)) |hid| {
+        id = hid;
+    } else if (c.lua_type(L, 1) == c.LUA_TNUMBER) {
+        id = @intCast(c.lua_tointegerx(L, 1, null));
+    } else {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected BufferHandle or buffer id number");
+    }
     const registry = global_registry orelse {
         return result.push_error(L, "INTERNAL_ERROR", "registry not initialized");
     };
     if (registry.close_buffer(id)) {
+        if (current_buffer_id == id) {
+            current_buffer_id = null;
+        }
         return result.push_success_bool(L, true);
     }
     return result.push_error(L, "INVALID_HANDLE", "buffer handle not found or already closed");
+}
+
+fn lua_get_id(L: ?*c.lua_State) callconv(.c) c_int {
+    const id = get_handle_id(L, 1) orelse return result.push_error(L, "INVALID_ARGUMENT", "expected BufferHandle");
+    _ = c.lua_pushinteger(L, @intCast(id));
+    return 1;
+}
+
+fn lua_get_path(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+    if (buf.file_path) |p| {
+        _ = c.lua_pushlstring(L, p.ptr, p.len);
+        return 1;
+    }
+    c.lua_pushnil(L);
+    return 1;
+}
+
+fn lua_get_name(L: ?*c.lua_State) callconv(.c) c_int {
+    const id = get_handle_id(L, 1) orelse return result.push_error(L, "INVALID_ARGUMENT", "expected BufferHandle");
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+    if (buf.file_path) |p| {
+        const basename = std.fs.path.basename(p);
+        _ = c.lua_pushlstring(L, basename.ptr, basename.len);
+        return 1;
+    }
+    var name_buf: [64]u8 = undefined;
+    const name_str = std.fmt.bufPrint(&name_buf, "[No Name] {d}", .{id}) catch "[No Name]";
+    _ = c.lua_pushlstring(L, name_str.ptr, name_str.len);
+    return 1;
+}
+
+fn lua_get_buffer_by_id(L: ?*c.lua_State) callconv(.c) c_int {
+    const reg = global_registry orelse return result.push_error(L, "INTERNAL_ERROR", "registry not initialized");
+    const id: u64 = @intCast(c.lua_tointegerx(L, 1, null));
+    if (reg.get(id) != null) {
+        push_buffer_handle(L, id);
+        return 1;
+    }
+    c.lua_pushnil(L);
+    return 1;
+}
+
+fn lua_list_buffers(L: ?*c.lua_State) callconv(.c) c_int {
+    const reg = global_registry orelse return result.push_error(L, "INTERNAL_ERROR", "registry not initialized");
+
+    const ids = reg.list_buffers(std.heap.c_allocator) catch return result.push_error(L, "OUT_OF_MEMORY", "failed to allocate buffer list");
+    defer std.heap.c_allocator.free(ids);
+
+    c.lua_createtable(L, @intCast(ids.len), 0);
+    for (ids, 0..) |id, idx| {
+        c.lua_createtable(L, 0, 5);
+
+        _ = c.lua_pushinteger(L, @intCast(id));
+        c.lua_setfield(L, -2, "id");
+
+        if (reg.get(id)) |buf| {
+            c.lua_pushboolean(L, if (buf.is_dirty) 1 else 0);
+            c.lua_setfield(L, -2, "is_dirty");
+
+            _ = c.lua_pushinteger(L, @intCast(buf.line_count()));
+            c.lua_setfield(L, -2, "line_count");
+
+            _ = c.lua_pushinteger(L, @intCast(buf.len()));
+            c.lua_setfield(L, -2, "len");
+
+            if (buf.file_path) |p| {
+                _ = c.lua_pushlstring(L, p.ptr, p.len);
+                c.lua_setfield(L, -2, "path");
+
+                const basename = std.fs.path.basename(p);
+                _ = c.lua_pushlstring(L, basename.ptr, basename.len);
+                c.lua_setfield(L, -2, "name");
+            } else {
+                c.lua_pushnil(L);
+                c.lua_setfield(L, -2, "path");
+
+                var name_buf: [64]u8 = undefined;
+                const name_str = std.fmt.bufPrint(&name_buf, "[No Name] {d}", .{id}) catch "[No Name]";
+                _ = c.lua_pushlstring(L, name_str.ptr, name_str.len);
+                c.lua_setfield(L, -2, "name");
+            }
+        }
+
+        c.lua_rawseti(L, -2, @intCast(idx + 1));
+    }
+    return 1;
 }
 
 fn lua_len(L: ?*c.lua_State) callconv(.c) c_int {
@@ -777,6 +901,102 @@ test "test_lua_clipboard_get_and_set" {
         \\editor.clipboard.set("lua clipboard text")
         \\local text = editor.clipboard.get()
         \\assert(text == "lua clipboard text")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_list_buffers" {
+    const script =
+        \\local b1, _, _ = editor.create_buffer()
+        \\b1:insert(0, "first buffer")
+        \\local b2, _, _ = editor.create_buffer()
+        \\b2:insert(0, "second buffer")
+        \\
+        \\local list = editor.list_buffers()
+        \\assert(#list >= 2)
+        \\local found1, found2 = false, false
+        \\for _, entry in ipairs(list) do
+        \\    if entry.id == b1:get_id() then found1 = true; assert(entry.is_dirty == true) end
+        \\    if entry.id == b2:get_id() then found2 = true end
+        \\end
+        \\assert(found1 and found2)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_next_and_prev" {
+    const script =
+        \\local b1, _, _ = editor.create_buffer()
+        \\local b2, _, _ = editor.create_buffer()
+        \\local b3, _, _ = editor.create_buffer()
+        \\
+        \\editor.set_current_buffer(b1)
+        \\editor.dispatch_command(":bn")
+        \\assert(editor.get_current_buffer():get_id() == b2:get_id())
+        \\editor.dispatch_command(":bnext")
+        \\assert(editor.get_current_buffer():get_id() == b3:get_id())
+        \\editor.dispatch_command(":bn")
+        \\assert(editor.get_current_buffer():get_id() == b1:get_id())
+        \\
+        \\editor.dispatch_command(":bp")
+        \\assert(editor.get_current_buffer():get_id() == b3:get_id())
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_switch_by_id_and_name" {
+    const script =
+        \\local b1, _, _ = editor.create_buffer()
+        \\local b2, _, _ = editor.create_buffer()
+        \\b2:save("/tmp/em_switch_test.lua")
+        \\
+        \\editor.set_current_buffer(b1)
+        \\editor.dispatch_command(":b " .. tostring(b2:get_id()))
+        \\assert(editor.get_current_buffer():get_id() == b2:get_id())
+        \\
+        \\editor.dispatch_command(":b " .. tostring(b1:get_id()))
+        \\assert(editor.get_current_buffer():get_id() == b1:get_id())
+        \\
+        \\editor.dispatch_command(":b switch_test")
+        \\assert(editor.get_current_buffer():get_id() == b2:get_id())
+        \\os.remove("/tmp/em_switch_test.lua")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_delete_clean_and_dirty" {
+    const script =
+        \\local b1, _, _ = editor.create_buffer()
+        \\local b2, _, _ = editor.create_buffer()
+        \\editor.set_current_buffer(b1)
+        \\b1:insert(0, "unsaved change")
+        \\
+        \\-- :bd fails on dirty
+        \\editor.dispatch_command(":bd")
+        \\assert(editor.get_last_error():find("No write since last change") ~= nil)
+        \\assert(editor.get_current_buffer():get_id() == b1:get_id())
+        \\
+        \\-- :bd! forces deletion
+        \\editor.dispatch_command(":bd!")
+        \\assert(editor.get_current_buffer():get_id() == b2:get_id())
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buffer_delete_last_spawns_scratch" {
+    const script =
+        \\local b1, _, _ = editor.create_buffer()
+        \\editor.set_current_buffer(b1)
+        \\local list = editor.list_buffers()
+        \\assert(#list >= 1)
+        \\for _, entry in ipairs(list) do
+        \\    editor.dispatch_command(":bd! " .. tostring(entry.id))
+        \\end
+        \\
+        \\local cur = editor.get_current_buffer()
+        \\assert(cur ~= nil)
+        \\assert(cur:is_dirty() == false)
+        \\assert(cur:len() == 0)
     ;
     try run_lua_test(script);
 }

@@ -31,9 +31,13 @@ end
 require("editor.commands")
 -- Load keymap subsystem
 require("editor.keymap")
+-- Load buffer management subsystem
+require("editor.buffers")
 
 -- Default keymaps
 editor.keymap.set("n", "<leader>w", ":w<CR>")
 editor.keymap.set("n", "<leader>q", ":q<CR>")
+editor.keymap.set("n", "<leader>bn", ":bn<CR>")
+editor.keymap.set("n", "<leader>bp", ":bp<CR>")
 
 return editor

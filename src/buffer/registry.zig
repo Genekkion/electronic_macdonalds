@@ -50,6 +50,22 @@ pub const BufferRegistry = struct {
         return self.buffers.get(id);
     }
 
+    pub fn count(self: *const BufferRegistry) usize {
+        return self.buffers.count();
+    }
+
+    pub fn list_buffers(self: *const BufferRegistry, allocator: Allocator) ![]u64 {
+        const result = try allocator.alloc(u64, self.buffers.count());
+        var it = self.buffers.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| {
+            result[i] = k.*;
+            i += 1;
+        }
+        std.mem.sort(u64, result, {}, std.sort.asc(u64));
+        return result;
+    }
+
     pub fn close_buffer(self: *BufferRegistry, id: u64) bool {
         if (self.buffers.fetchRemove(id)) |kv| {
             kv.value.deinit();
