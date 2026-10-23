@@ -33,6 +33,7 @@
 @property (nonatomic, assign) KeyDownCallback keyDownCb;
 @property (nonatomic, assign) int cursorLine;
 @property (nonatomic, assign) int cursorCol;
+@property (nonatomic, assign) int scrollTopLine;
 @property (nonatomic, assign) int mode;
 @property (nonatomic, assign) int cmdCursorCol;
 @property (nonatomic, copy) NSString *statusText;
@@ -61,6 +62,7 @@
     if (self) {
         _cursorLine = 0;
         _cursorCol = 0;
+        _scrollTopLine = 0;
         _mode = 0;
         _cmdCursorCol = -1;
         _showLineNumbers = YES;
@@ -154,7 +156,10 @@
 
     int totalLines = _getLineCountCb(_ctx);
     int visibleRows = (int)floor((statusY) / _lineHeight);
-    int maxLine = totalLines < visibleRows ? totalLines : visibleRows;
+    if (visibleRows < 0) visibleRows = 0;
+    int scrollTop = _scrollTopLine;
+    int maxLine = (totalLines - scrollTop < visibleRows) ? (totalLines - scrollTop) : visibleRows;
+    if (maxLine < 0) maxLine = 0;
 
     CGFloat gutterWidth = 0.0;
     CGFloat textStartX = 10.0;
@@ -190,10 +195,11 @@
         };
 
         for (int i = 0; i < maxLine; i++) {
-            int lineNum = i + 1;
-            BOOL isActive = (i == _cursorLine);
+            int lineIdx = scrollTop + i;
+            int lineNum = lineIdx + 1;
+            BOOL isActive = (lineIdx == _cursorLine);
             if (_relativeLineNumbers && !isActive) {
-                lineNum = abs(i - _cursorLine);
+                lineNum = abs(lineIdx - _cursorLine);
             }
             NSString *numStr = [NSString stringWithFormat:@"%*d", digits, lineNum];
             NSAttributedString *attrNum = [[NSAttributedString alloc] initWithString:numStr attributes:(isActive ? activeNumAttrs : normalNumAttrs)];
@@ -213,38 +219,42 @@
         CGContextSetRGBFillColor(context, 0.22, 0.35, 0.55, 0.65);
         int startL = _selStartLine;
         int endL = _selEndLine;
-        for (int i = startL; i <= endL && i < maxLine; i++) {
-            NSRect selRect;
-            if (_isLineSelection) {
-                selRect = NSMakeRect(textStartX, i * _lineHeight, self.bounds.size.width - textStartX, _lineHeight);
-            } else if (startL == endL) {
-                CGFloat startX = textStartX + _selStartCol * _charWidth;
-                CGFloat width = (_selEndCol - _selStartCol + 1) * _charWidth;
-                selRect = NSMakeRect(startX, i * _lineHeight, width, _lineHeight);
-            } else if (i == startL) {
-                CGFloat startX = textStartX + _selStartCol * _charWidth;
-                CGFloat width = self.bounds.size.width - startX;
-                selRect = NSMakeRect(startX, i * _lineHeight, width, _lineHeight);
-            } else if (i == endL) {
-                CGFloat width = (_selEndCol + 1) * _charWidth;
-                selRect = NSMakeRect(textStartX, i * _lineHeight, width, _lineHeight);
-            } else {
-                selRect = NSMakeRect(textStartX, i * _lineHeight, self.bounds.size.width - textStartX, _lineHeight);
+        for (int i = 0; i < maxLine; i++) {
+            int lineIdx = scrollTop + i;
+            if (lineIdx >= startL && lineIdx <= endL) {
+                NSRect selRect;
+                if (_isLineSelection) {
+                    selRect = NSMakeRect(textStartX, i * _lineHeight, self.bounds.size.width - textStartX, _lineHeight);
+                } else if (startL == endL) {
+                    CGFloat startX = textStartX + _selStartCol * _charWidth;
+                    CGFloat width = (_selEndCol - _selStartCol + 1) * _charWidth;
+                    selRect = NSMakeRect(startX, i * _lineHeight, width, _lineHeight);
+                } else if (lineIdx == startL) {
+                    CGFloat startX = textStartX + _selStartCol * _charWidth;
+                    CGFloat width = self.bounds.size.width - startX;
+                    selRect = NSMakeRect(startX, i * _lineHeight, width, _lineHeight);
+                } else if (lineIdx == endL) {
+                    CGFloat width = (_selEndCol + 1) * _charWidth;
+                    selRect = NSMakeRect(textStartX, i * _lineHeight, width, _lineHeight);
+                } else {
+                    selRect = NSMakeRect(textStartX, i * _lineHeight, self.bounds.size.width - textStartX, _lineHeight);
+                }
+                CGContextFillRect(context, selRect);
             }
-            CGContextFillRect(context, selRect);
         }
     }
 
     // 2.5 Draw search highlights if active
     if (_hasSearchHighlights && _searchHighlightCount > 0) {
         CGContextSetRGBFillColor(context, 0.95, 0.75, 0.15, 0.40); // Soft amber gold
-        for (int i = 0; i < _searchHighlightCount; i++) {
-            int line = _searchHighlights[i * 3 + 0];
-            int col = _searchHighlights[i * 3 + 1];
-            int len = _searchHighlights[i * 3 + 2];
-            if (line < maxLine) {
+        for (int j = 0; j < _searchHighlightCount; j++) {
+            int line = _searchHighlights[j * 3 + 0];
+            int col = _searchHighlights[j * 3 + 1];
+            int len = _searchHighlights[j * 3 + 2];
+            if (line >= scrollTop && line < scrollTop + maxLine) {
+                int visibleRow = line - scrollTop;
                 CGFloat x = textStartX + col * _charWidth;
-                CGFloat y = line * _lineHeight;
+                CGFloat y = visibleRow * _lineHeight;
                 CGFloat w = len * _charWidth;
                 CGContextFillRect(context, NSMakeRect(x, y, w, _lineHeight));
             }
@@ -253,8 +263,9 @@
 
     // 3. Draw lines of text
     for (int i = 0; i < maxLine; i++) {
+        int lineIdx = scrollTop + i;
         int len = 0;
-        const char *bytes = _getLineCb(_ctx, i, &len);
+        const char *bytes = _getLineCb(_ctx, lineIdx, &len);
         if (bytes && len > 0) {
             NSString *str = [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
             if (str) {
@@ -266,16 +277,19 @@
 
     // 3. Draw buffer cursor (block for Normal, bar for Insert, subtle preview block for Command-line)
     if (_cursorVisible) {
-        CGFloat cursorX = textStartX + _cursorCol * _charWidth;
-        CGFloat cursorY = _cursorLine * _lineHeight;
-        CGFloat cursorW = (_mode == 1) ? 2.0 : _charWidth;
-        NSRect cursorRect = NSMakeRect(cursorX, cursorY, cursorW, _lineHeight);
-        if (_mode == 3) {
-            CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.40);
-        } else {
-            CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.75);
+        if (_cursorLine >= scrollTop && _cursorLine < scrollTop + maxLine) {
+            int visibleRow = _cursorLine - scrollTop;
+            CGFloat cursorX = textStartX + _cursorCol * _charWidth;
+            CGFloat cursorY = visibleRow * _lineHeight;
+            CGFloat cursorW = (_mode == 1) ? 2.0 : _charWidth;
+            NSRect cursorRect = NSMakeRect(cursorX, cursorY, cursorW, _lineHeight);
+            if (_mode == 3) {
+                CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.40);
+            } else {
+                CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.75);
+            }
+            CGContextFillRect(context, cursorRect);
         }
-        CGContextFillRect(context, cursorRect);
     }
 
     // 4. Draw status line background at bottom
@@ -417,6 +431,17 @@ void macos_window_set_command_cursor(void *win, int col) {
         if ([[window contentView] isKindOfClass:[EditorView class]]) {
             EditorView *view = (EditorView *)[window contentView];
             view.cmdCursorCol = col;
+            [view setNeedsDisplay:YES];
+        }
+    }
+}
+
+void macos_window_set_scroll_top(void *win, int scroll_top) {
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win;
+        if ([[window contentView] isKindOfClass:[EditorView class]]) {
+            EditorView *view = (EditorView *)[window contentView];
+            view.scrollTopLine = scroll_top;
             [view setNeedsDisplay:YES];
         }
     }

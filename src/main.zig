@@ -12,6 +12,15 @@ const macos = @cImport({
 var g_active_buffer: ?*root.Buffer = null;
 var g_editor = EditorState{};
 var g_window: ?*anyopaque = null;
+var g_viewport = root.viewport.Viewport{
+    .pixel_width = 1024.0,
+    .pixel_height = 768.0 - 22.0,
+    .metrics = .{
+        .char_width = 8.4,
+        .line_height = 17.0,
+        .ascent = 12.0,
+    },
+};
 var g_line_buffer: [4096]u8 = undefined;
 var g_lua: ?*c.lua_State = null;
 var g_registry: ?*root.BufferRegistry = null;
@@ -157,6 +166,10 @@ fn updateUi() void {
     const show_nu = getLuaOptionBool("number", true);
     const rel_nu = getLuaOptionBool("relativenumber", false);
     macos.macos_window_set_line_numbers(win, show_nu, rel_nu);
+
+    // Update scrolling with dynamic padding
+    g_viewport.update_scroll_with_padding(g_editor.cursor.line, buf.line_count(), 4);
+    macos.macos_window_set_scroll_top(win, @intCast(g_viewport.scroll_top_line));
 
     const mode_int: c_int = switch (g_editor.mode) {
         .normal => 0,
