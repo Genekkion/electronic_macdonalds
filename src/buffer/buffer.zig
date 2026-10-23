@@ -167,6 +167,15 @@ pub const Buffer = struct {
         return result;
     }
 
+    pub fn byte_at(self: *const Buffer, offset: usize) ?u8 {
+        if (offset >= self.len()) return null;
+        if (offset < self.gap_start) {
+            return self.data[offset];
+        } else {
+            return self.data[offset + (self.gap_end - self.gap_start)];
+        }
+    }
+
     pub fn get_line(self: *const Buffer, allocator: Allocator, line_idx: usize) Error!?[]u8 {
         const start = self.lines.get_line_start(line_idx) orelse return null;
         const end = self.lines.get_line_end(line_idx, self.len()) orelse return null;

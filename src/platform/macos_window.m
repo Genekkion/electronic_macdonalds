@@ -30,6 +30,8 @@
 @property (nonatomic, assign) KeyDownCallback keyDownCb;
 @property (nonatomic, assign) int cursorLine;
 @property (nonatomic, assign) int cursorCol;
+@property (nonatomic, assign) int mode;
+@property (nonatomic, copy) NSString *statusText;
 @property (nonatomic, assign) BOOL cursorVisible;
 @property (nonatomic, strong) NSTimer *blinkTimer;
 @property (nonatomic, assign) CTFontRef font;
@@ -45,6 +47,8 @@
     if (self) {
         _cursorLine = 0;
         _cursorCol = 0;
+        _mode = 0;
+        _statusText = @"";
         _cursorVisible = YES;
 
         _font = CTFontCreateWithName(CFSTR("Menlo"), 14.0, NULL);
@@ -128,8 +132,11 @@
 
     if (!_getLineCb || !_getLineCountCb || !_font) return;
 
+    CGFloat statusHeight = _lineHeight + 6.0;
+    CGFloat statusY = self.bounds.size.height - statusHeight;
+
     int totalLines = _getLineCountCb(_ctx);
-    int visibleRows = (int)ceil(self.bounds.size.height / _lineHeight);
+    int visibleRows = (int)floor((statusY) / _lineHeight);
     int maxLine = totalLines < visibleRows ? totalLines : visibleRows;
 
     // Attributes for text rendering
@@ -152,13 +159,47 @@
         }
     }
 
-    // 3. Draw cursor (block cursor #528bff with blinking)
+    // 3. Draw cursor
     if (_cursorVisible) {
-        CGFloat cursorX = 10.0 + _cursorCol * _charWidth;
-        CGFloat cursorY = _cursorLine * _lineHeight;
-        NSRect cursorRect = NSMakeRect(cursorX, cursorY, _charWidth, _lineHeight);
-        CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.65);
-        CGContextFillRect(context, cursorRect);
+        if (_mode == 3) {
+            // Command-line mode: draw bar cursor directly on the status bar
+            CGFloat textLen = _statusText ? (CGFloat)[_statusText length] : 0.0;
+            CGFloat cursorX = 10.0 + textLen * _charWidth;
+            CGFloat cursorY = statusY + 3.0;
+            NSRect cursorRect = NSMakeRect(cursorX, cursorY, 2.0, _lineHeight);
+            CGContextSetRGBFillColor(context, 0.4, 0.7, 1.0, 0.9);
+            CGContextFillRect(context, cursorRect);
+        } else {
+            // Buffer cursor (block for Normal, bar for Insert)
+            CGFloat cursorX = 10.0 + _cursorCol * _charWidth;
+            CGFloat cursorY = _cursorLine * _lineHeight;
+            CGFloat cursorW = (_mode == 1) ? 2.0 : _charWidth;
+            NSRect cursorRect = NSMakeRect(cursorX, cursorY, cursorW, _lineHeight);
+            CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.75);
+            CGContextFillRect(context, cursorRect);
+        }
+    }
+
+    // 4. Draw status line at bottom
+    NSRect statusRect = NSMakeRect(0, statusY, self.bounds.size.width, statusHeight);
+    CGContextSetRGBFillColor(context, 0.15, 0.17, 0.21, 1.0);
+    CGContextFillRect(context, statusRect);
+
+    CGContextSetRGBStrokeColor(context, 0.25, 0.28, 0.35, 1.0);
+    CGContextSetLineWidth(context, 1.0);
+    CGPoint points[2] = { CGPointMake(0, statusY), CGPointMake(self.bounds.size.width, statusY) };
+    CGContextStrokeLineSegments(context, points, 2);
+
+    if (_statusText && _statusText.length > 0) {
+        NSColor *statusColor = (_mode == 1)
+            ? [NSColor colorWithCalibratedRed:0.35 green:0.85 blue:0.45 alpha:1.0]
+            : [NSColor colorWithCalibratedRed:0.85 green:0.85 blue:0.85 alpha:1.0];
+        NSDictionary *statusAttrs = @{
+            NSFontAttributeName: (__bridge id)_font,
+            NSForegroundColorAttributeName: statusColor
+        };
+        NSAttributedString *attrStatus = [[NSAttributedString alloc] initWithString:_statusText attributes:statusAttrs];
+        [attrStatus drawAtPoint:NSMakePoint(10.0, statusY + 3.0)];
     }
 }
 
@@ -245,12 +286,28 @@ void macos_window_attach_editor_view(
 }
 
 void macos_window_set_cursor(void *win, int line, int col) {
+    macos_window_set_cursor_mode(win, line, col, 0);
+}
+
+void macos_window_set_cursor_mode(void *win, int line, int col, int mode) {
     @autoreleasepool {
         NSWindow *window = (__bridge NSWindow *)win;
         if ([[window contentView] isKindOfClass:[EditorView class]]) {
             EditorView *view = (EditorView *)[window contentView];
             view.cursorLine = line;
             view.cursorCol = col;
+            view.mode = mode;
+            [view setNeedsDisplay:YES];
+        }
+    }
+}
+
+void macos_window_set_status_line(void *win, const char *status_text) {
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win;
+        if ([[window contentView] isKindOfClass:[EditorView class]]) {
+            EditorView *view = (EditorView *)[window contentView];
+            view.statusText = status_text ? [NSString stringWithUTF8String:status_text] : @"";
             [view setNeedsDisplay:YES];
         }
     }

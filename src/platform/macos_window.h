@@ -23,6 +23,8 @@ void macos_window_attach_editor_view(
     KeyDownCallback on_key_down
 );
 void macos_window_set_cursor(void *win, int line, int col);
+void macos_window_set_cursor_mode(void *win, int line, int col, int mode);
+void macos_window_set_status_line(void *win, const char *status_text);
 void macos_window_redraw(void *win);
 bool macos_app_poll_events(void);
 void macos_app_run(void);
