@@ -1,19 +1,13 @@
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const c = @import("c.zig").c;
 
-const posix_c = @cImport({
-    @cInclude("dirent.h");
-    @cInclude("sys/stat.h");
-    @cInclude("unistd.h");
-});
-
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
-extern "c" fn ftell(stream: *std.c.FILE) c_long;
-extern "c" fn unlink(path: [*c]const u8) c_int;
-const SEEK_SET: c_int = 0;
-const SEEK_END: c_int = 2;
+
+fn default_io() Io {
+    return Io.Threaded.global_single_threaded.io();
+}
 
 pub fn get_config_dir(allocator: Allocator) ![:0]u8 {
     if (getenv("XDG_CONFIG_HOME")) |cfg_home| {
@@ -68,22 +62,18 @@ pub fn setup_package_path(L: *c.lua_State, allocator: Allocator, config_dir: []c
 
     // 2. Add plugin directories if present
     if (plugins_dir) |pdir| {
-        const pdir_z = try allocator.dupeZ(u8, pdir);
-        defer allocator.free(pdir_z);
-
-        const dir_handle = posix_c.opendir(pdir_z.ptr);
-        if (dir_handle != null) {
-            defer _ = posix_c.closedir(dir_handle);
-            while (posix_c.readdir(dir_handle)) |entry| {
-                const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
-                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-
-                const plug_p1 = try std.fmt.allocPrint(allocator, "{s}/{s}/lua/?.lua", .{ pdir, name });
-                const plug_p2 = try std.fmt.allocPrint(allocator, "{s}/{s}/lua/?/init.lua", .{ pdir, name });
+        const io = default_io();
+        if (Io.Dir.cwd().openDir(io, pdir, .{ .iterate = true })) |dir_val| {
+            var dir = dir_val;
+            defer dir.close(io);
+            var iter = dir.iterate();
+            while (iter.next(io) catch null) |entry| {
+                const plug_p1 = try std.fmt.allocPrint(allocator, "{s}/{s}/lua/?.lua", .{ pdir, entry.name });
+                const plug_p2 = try std.fmt.allocPrint(allocator, "{s}/{s}/lua/?/init.lua", .{ pdir, entry.name });
                 try extra_paths.append(allocator, plug_p1);
                 try extra_paths.append(allocator, plug_p2);
             }
-        }
+        } else |_| {}
     }
 
     // Join extra paths with semicolon
@@ -102,22 +92,13 @@ pub fn setup_package_path(L: *c.lua_State, allocator: Allocator, config_dir: []c
 }
 
 pub fn load_user_config(L: *c.lua_State, allocator: Allocator, path: []const u8) !?[:0]u8 {
+    const io = default_io();
+    const buf = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024)) catch return null;
+    defer allocator.free(buf);
+    if (buf.len == 0) return null;
+
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-
-    const f = std.c.fopen(path_z.ptr, "rb") orelse return null; // File does not exist, silent fallback
-    defer _ = std.c.fclose(f);
-
-    _ = fseek(f, 0, SEEK_END);
-    const sz = ftell(f);
-    if (sz <= 0) return null;
-    _ = fseek(f, 0, SEEK_SET);
-
-    const buf = try allocator.alloc(u8, @intCast(sz));
-    defer allocator.free(buf);
-
-    const read_bytes = std.c.fread(buf.ptr, 1, buf.len, f);
-    if (read_bytes != buf.len) return null;
 
     if (c.luaL_loadbufferx(L, buf.ptr, buf.len, path_z.ptr, null) != 0) {
         const err_str = if (c.lua_tolstring(L, -1, null)) |ptr| std.mem.span(ptr) else "syntax error";
@@ -138,31 +119,23 @@ pub fn load_user_config(L: *c.lua_State, allocator: Allocator, path: []const u8)
 
 pub fn load_plugin_scripts(L: *c.lua_State, allocator: Allocator, plugins_dir: ?[]const u8) void {
     const pdir = plugins_dir orelse return;
-    const pdir_z = allocator.dupeZ(u8, pdir) catch return;
-    defer allocator.free(pdir_z);
+    const io = default_io();
 
-    const dir_handle = posix_c.opendir(pdir_z.ptr);
-    if (dir_handle == null) return;
-    defer _ = posix_c.closedir(dir_handle);
+    var dir = Io.Dir.cwd().openDir(io, pdir, .{ .iterate = true }) catch return;
+    defer dir.close(io);
 
-    while (posix_c.readdir(dir_handle)) |entry| {
-        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
-        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-
-        const plugin_dir = std.fmt.allocPrint(allocator, "{s}/{s}/plugin", .{ pdir, name }) catch continue;
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        const plugin_dir = std.fmt.allocPrint(allocator, "{s}/{s}/plugin", .{ pdir, entry.name }) catch continue;
         defer allocator.free(plugin_dir);
 
-        const plugin_dir_z = allocator.dupeZ(u8, plugin_dir) catch continue;
-        defer allocator.free(plugin_dir_z);
+        var psub = Io.Dir.cwd().openDir(io, plugin_dir, .{ .iterate = true }) catch continue;
+        defer psub.close(io);
 
-        const psub_handle = posix_c.opendir(plugin_dir_z.ptr);
-        if (psub_handle == null) continue;
-        defer _ = posix_c.closedir(psub_handle);
-
-        while (posix_c.readdir(psub_handle)) |script_entry| {
-            const script_name = std.mem.span(@as([*:0]const u8, @ptrCast(&script_entry.*.d_name)));
-            if (std.mem.endsWith(u8, script_name, ".lua")) {
-                const full_script_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ plugin_dir, script_name }) catch continue;
+        var sub_iter = psub.iterate();
+        while (sub_iter.next(io) catch null) |script_entry| {
+            if (std.mem.endsWith(u8, script_entry.name, ".lua")) {
+                const full_script_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ plugin_dir, script_entry.name }) catch continue;
                 defer allocator.free(full_script_path);
 
                 _ = load_user_config(L, allocator, full_script_path) catch null;
@@ -204,14 +177,10 @@ test "test_config_protected_load_syntax_error" {
     defer c.lua_close(L);
     c.luaL_openlibs(L);
 
+    const io = testing.io;
     const tmp_path = "tmp_bad_syntax_init.lua";
-    {
-        const f = std.c.fopen(tmp_path, "wb").?;
-        defer _ = std.c.fclose(f);
-        const bad_code = "this is not valid lua code !@#$";
-        _ = std.c.fwrite(bad_code.ptr, 1, bad_code.len, f);
-    }
-    defer _ = unlink(tmp_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = "this is not valid lua code !@#$" });
+    defer Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     const err_opt = try load_user_config(L, testing.allocator, tmp_path);
     try testing.expect(err_opt != null);
@@ -226,14 +195,10 @@ test "test_config_protected_load_success" {
     defer c.lua_close(L);
     c.luaL_openlibs(L);
 
+    const io = testing.io;
     const tmp_path = "tmp_good_init.lua";
-    {
-        const f = std.c.fopen(tmp_path, "wb").?;
-        defer _ = std.c.fclose(f);
-        const good_code = "_G.__test_cfg_var = 12345\n";
-        _ = std.c.fwrite(good_code.ptr, 1, good_code.len, f);
-    }
-    defer _ = unlink(tmp_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = "_G.__test_cfg_var = 12345\n" });
+    defer Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     const err_opt = try load_user_config(L, testing.allocator, tmp_path);
     try testing.expect(err_opt == null);

@@ -1,36 +1,33 @@
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const undo = @import("undo.zig");
 const UndoTree = undo.UndoTree;
 const UndoNode = undo.UndoNode;
 
-extern "c" fn remove(path: [*:0]const u8) c_int;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+
+fn default_io() Io {
+    return Io.Threaded.global_single_threaded.io();
+}
 
 fn ensure_dir_recursive(path: []const u8) void {
-    var buf: [1024:0]u8 = undefined;
-    if (path.len >= 1024) return;
-    for (path, 0..) |ch, i| {
-        buf[i] = ch;
-        if (ch == '/' and i > 0) {
-            buf[i] = 0;
-            _ = mkdir(&buf, 0o755);
-            buf[i] = '/';
-        }
-    }
-    buf[path.len] = 0;
-    _ = mkdir(&buf, 0o755);
+    if (path.len == 0) return;
+    Io.Dir.cwd().createDirPath(default_io(), path) catch {};
 }
 
-fn writeSlice(comptime T: type, slice: []const T, f: *std.c.FILE) bool {
+fn appendSliceBytes(comptime T: type, list: *std.ArrayList(u8), allocator: Allocator, slice: []const T) PersistError!void {
     const bytes = std.mem.sliceAsBytes(slice);
-    return std.c.fwrite(bytes.ptr, 1, bytes.len, f) == bytes.len;
+    list.appendSlice(allocator, bytes) catch return error.OutOfMemory;
 }
 
-fn readSlice(comptime T: type, slice: []T, f: *std.c.FILE) bool {
-    const bytes = std.mem.sliceAsBytes(slice);
-    return std.c.fread(bytes.ptr, 1, bytes.len, f) == bytes.len;
+fn readSliceFromCursor(comptime T: type, slice: []T, data: []const u8, cursor: *usize) bool {
+    const out_bytes = std.mem.sliceAsBytes(slice);
+    if (cursor.* + out_bytes.len > data.len) return false;
+    @memcpy(out_bytes, data[cursor.* .. cursor.* + out_bytes.len]);
+    cursor.* += out_bytes.len;
+    return true
+;
 }
 
 pub const MAGIC: [4]u8 = "EMUN".*;
@@ -84,21 +81,21 @@ pub fn save_undo_file(
     save_path: [:0]const u8,
     allocator: Allocator,
 ) PersistError!void {
-    const f = std.c.fopen(save_path.ptr, "wb") orelse return error.FileOpenFailed;
-    defer _ = std.c.fclose(f);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
 
     // 1. Write Header
-    if (!writeSlice(u8, &MAGIC, f)) return error.WriteFailed;
+    try appendSliceBytes(u8, &out, allocator, &MAGIC);
     const version = [_]u8{VERSION};
-    if (!writeSlice(u8, &version, f)) return error.WriteFailed;
+    try appendSliceBytes(u8, &out, allocator, &version);
 
     // 2. Write Checksum of current buffer content
     const hash = compute_sha256(content);
-    if (!writeSlice(u8, &hash, f)) return error.WriteFailed;
+    try appendSliceBytes(u8, &out, allocator, &hash);
 
     // 3. Write Current seq and Saved seq
     const meta = [_]u64{ tree.current.seq, tree.saved_seq orelse 0 };
-    if (!writeSlice(u64, &meta, f)) return error.WriteFailed;
+    try appendSliceBytes(u64, &out, allocator, &meta);
 
     // 4. Collect nodes (exclude root seq 0)
     const count = tree.all_nodes.count();
@@ -125,7 +122,7 @@ pub fn save_undo_file(
     }
 
     const eligible_buf = [_]u32{eligible_count};
-    if (!writeSlice(u32, &eligible_buf, f)) return error.WriteFailed;
+    try appendSliceBytes(u32, &out, allocator, &eligible_buf);
 
     // 5. Write each node
     for (nodes) |node| {
@@ -133,7 +130,7 @@ pub fn save_undo_file(
 
         const parent_seq: u64 = if (node.parent) |p| p.seq else 0;
         const node_hdr = [_]u64{ node.seq, parent_seq, @intCast(node.timestamp) };
-        if (!writeSlice(u64, &node_hdr, f)) return error.WriteFailed;
+        try appendSliceBytes(u64, &out, allocator, &node_hdr);
 
         const cursors = [_]u32{
             @intCast(node.cursor_line),
@@ -142,19 +139,20 @@ pub fn save_undo_file(
             @intCast(node.delta.inserted.len),
             @intCast(node.delta.deleted.len),
         };
-        if (!writeSlice(u32, &cursors, f)) return error.WriteFailed;
+        try appendSliceBytes(u32, &out, allocator, &cursors);
 
         if (node.delta.inserted.len > 0) {
-            if (!writeSlice(u8, node.delta.inserted, f)) {
-                return error.WriteFailed;
-            }
+            try appendSliceBytes(u8, &out, allocator, node.delta.inserted);
         }
         if (node.delta.deleted.len > 0) {
-            if (!writeSlice(u8, node.delta.deleted, f)) {
-                return error.WriteFailed;
-            }
+            try appendSliceBytes(u8, &out, allocator, node.delta.deleted);
         }
     }
+
+    Io.Dir.cwd().writeFile(default_io(), .{
+        .sub_path = save_path,
+        .data = out.items,
+    }) catch return error.WriteFailed;
 }
 
 pub fn load_undo_file(
@@ -163,47 +161,54 @@ pub fn load_undo_file(
     load_path: [:0]const u8,
     allocator: Allocator,
 ) PersistError!void {
-    const f = std.c.fopen(load_path.ptr, "rb") orelse return error.FileOpenFailed;
-    defer _ = std.c.fclose(f);
+    const file_bytes = Io.Dir.cwd().readFileAlloc(
+        default_io(),
+        load_path,
+        allocator,
+        .limited(32 * 1024 * 1024),
+    ) catch return error.FileOpenFailed;
+    defer allocator.free(file_bytes);
+
+    var cursor: usize = 0;
 
     // 1. Read and verify Magic
     var magic: [4]u8 = undefined;
-    if (!readSlice(u8, &magic, f)) return error.ReadFailed;
+    if (!readSliceFromCursor(u8, &magic, file_bytes, &cursor)) return error.ReadFailed;
     if (!std.mem.eql(u8, &magic, &MAGIC)) return error.InvalidMagic;
 
     // 2. Read and verify Version
     var version: [1]u8 = undefined;
-    if (!readSlice(u8, &version, f)) return error.ReadFailed;
+    if (!readSliceFromCursor(u8, &version, file_bytes, &cursor)) return error.ReadFailed;
     if (version[0] != VERSION) return error.UnsupportedVersion;
 
     // 3. Verify Checksum
     var stored_hash: [32]u8 = undefined;
-    if (!readSlice(u8, &stored_hash, f)) return error.ReadFailed;
+    if (!readSliceFromCursor(u8, &stored_hash, file_bytes, &cursor)) return error.ReadFailed;
     const actual_hash = compute_sha256(content);
     if (!std.mem.eql(u8, &stored_hash, &actual_hash)) return error.ChecksumMismatch;
 
     // 4. Read Current and Saved seq
     var meta: [2]u64 = undefined;
-    if (!readSlice(u64, &meta, f)) return error.ReadFailed;
+    if (!readSliceFromCursor(u64, &meta, file_bytes, &cursor)) return error.ReadFailed;
     const cur_seq = meta[0];
     const saved_seq = meta[1];
 
     // 5. Read eligible count
     var count_buf: [1]u32 = undefined;
-    if (!readSlice(u32, &count_buf, f)) return error.ReadFailed;
+    if (!readSliceFromCursor(u32, &count_buf, file_bytes, &cursor)) return error.ReadFailed;
     const node_count = count_buf[0];
 
     // 6. Read each node and insert into tree
     var i: u32 = 0;
     while (i < node_count) : (i += 1) {
         var node_hdr: [3]u64 = undefined;
-        if (!readSlice(u64, &node_hdr, f)) return error.ReadFailed;
+        if (!readSliceFromCursor(u64, &node_hdr, file_bytes, &cursor)) return error.ReadFailed;
         const seq = node_hdr[0];
         const parent_seq = node_hdr[1];
         const timestamp: i64 = @intCast(node_hdr[2]);
 
         var cursors: [5]u32 = undefined;
-        if (!readSlice(u32, &cursors, f)) return error.ReadFailed;
+        if (!readSliceFromCursor(u32, &cursors, file_bytes, &cursor)) return error.ReadFailed;
         const line: usize = cursors[0];
         const col: usize = cursors[1];
         const offset: usize = cursors[2];
@@ -213,13 +218,13 @@ pub fn load_undo_file(
         const ins_bytes = try allocator.alloc(u8, ins_len);
         errdefer allocator.free(ins_bytes);
         if (ins_len > 0) {
-            if (!readSlice(u8, ins_bytes, f)) return error.ReadFailed;
+            if (!readSliceFromCursor(u8, ins_bytes, file_bytes, &cursor)) return error.ReadFailed;
         }
 
         const del_bytes = try allocator.alloc(u8, del_len);
         errdefer allocator.free(del_bytes);
         if (del_len > 0) {
-            if (!readSlice(u8, del_bytes, f)) return error.ReadFailed;
+            if (!readSliceFromCursor(u8, del_bytes, file_bytes, &cursor)) return error.ReadFailed;
         }
 
         const parent_node = tree.get_node(parent_seq) orelse tree.root;
@@ -265,7 +270,7 @@ test "test_undo_persistence_roundtrip" {
 
     const content = "first branched";
     const undo_path = "/tmp/em_test_undo_roundtrip.undo";
-    defer _ = remove(undo_path);
+    defer Io.Dir.cwd().deleteFile(testing.io, undo_path) catch {};
 
     try save_undo_file(&tree, content, undo_path, testing.allocator);
 
@@ -294,7 +299,7 @@ test "test_undo_persistence_rejects_corrupted_checksum" {
 
     const orig_content = "data";
     const undo_path = "/tmp/em_test_undo_checksum.undo";
-    defer _ = remove(undo_path);
+    defer Io.Dir.cwd().deleteFile(testing.io, undo_path) catch {};
 
     try save_undo_file(&tree, orig_content, undo_path, testing.allocator);
 

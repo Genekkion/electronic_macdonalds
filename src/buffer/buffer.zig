@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 pub const Marker = @import("marker.zig").Marker;
@@ -7,18 +8,15 @@ pub const undo_mod = @import("undo.zig");
 pub const undo_persist_mod = @import("undo_persist.zig");
 pub const patience_mod = @import("patience.zig");
 
-const posix_c = @cImport({
-    @cInclude("sys/stat.h");
-    @cInclude("unistd.h");
-});
-
-pub extern "c" fn usleep(usec: c_uint) c_int;
 pub extern "c" fn em_log(fmt: [*c]const u8, ...) void;
 
-fn get_file_mtime(path: [*:0]const u8) ?i128 {
-    var st: posix_c.struct_stat = undefined;
-    if (posix_c.stat(path, &st) != 0) return null;
-    return @as(i128, st.st_mtimespec.tv_sec) * 1_000_000_000 + @as(i128, st.st_mtimespec.tv_nsec);
+fn default_io() Io {
+    return Io.Threaded.global_single_threaded.io();
+}
+
+fn get_file_mtime(path: []const u8) ?i128 {
+    const st = Io.Dir.cwd().statFile(default_io(), path, .{}) catch return null;
+    return st.mtime.nanoseconds;
 }
 
 pub const Buffer = struct {
@@ -342,30 +340,26 @@ pub const Buffer = struct {
         }
     }
 
-    extern "c" fn fseek(stream: ?*anyopaque, offset: c_long, whence: c_int) c_int;
-    extern "c" fn ftell(stream: ?*anyopaque) c_long;
-
     pub fn save_to_file(self: *Buffer, path: [:0]const u8) FileError!void {
-        const f = std.c.fopen(path.ptr, "wb") orelse return error.FileOpenFailed;
+        const io = default_io();
+        var file = Io.Dir.cwd().createFile(io, path, .{}) catch return error.FileOpenFailed;
         var closed = false;
         defer if (!closed) {
-            _ = std.c.fclose(f);
+            file.close(io);
         };
 
         // Write pre-gap segment
         if (self.gap_start > 0) {
-            const written = std.c.fwrite(self.data[0..self.gap_start].ptr, 1, self.gap_start, f);
-            if (written < self.gap_start) return error.WriteFailed;
+            file.writeStreamingAll(io, self.data[0..self.gap_start]) catch return error.WriteFailed;
         }
 
         // Write post-gap segment
         const post_len = self.data.len - self.gap_end;
         if (post_len > 0) {
-            const written = std.c.fwrite(self.data[self.gap_end..].ptr, 1, post_len, f);
-            if (written < post_len) return error.WriteFailed;
+            file.writeStreamingAll(io, self.data[self.gap_end..]) catch return error.WriteFailed;
         }
 
-        _ = std.c.fclose(f);
+        file.close(io);
         closed = true;
 
         if (self.file_path) |old_p| {
@@ -376,7 +370,7 @@ pub const Buffer = struct {
         self.undo_tree.mark_saved();
 
         if (self.file_path) |p| {
-            if (get_file_mtime(p.ptr)) |mt| {
+            if (get_file_mtime(p)) |mt| {
                 self.mtime = mt;
             }
         }
@@ -406,26 +400,19 @@ pub const Buffer = struct {
     }
 
     pub fn load_from_file(allocator: Allocator, path: [:0]const u8) FileError!Buffer {
-        const f = std.c.fopen(path.ptr, "rb") orelse return error.FileNotFound;
-        defer _ = std.c.fclose(f);
-
-        _ = fseek(f, 0, 2); // SEEK_END
-        const size_long = ftell(f);
-        if (size_long < 0) return error.ReadFailed;
-        const file_size: usize = @intCast(size_long);
-        _ = fseek(f, 0, 0); // SEEK_SET
+        const io = default_io();
+        const temp = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(128 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return error.FileNotFound,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ReadFailed,
+        };
+        defer allocator.free(temp);
 
         var buf = Buffer.init(allocator);
         errdefer buf.deinit();
 
-        if (file_size > 0) {
-            const temp = allocator.alloc(u8, file_size) catch return error.OutOfMemory;
-            defer allocator.free(temp);
-
-            const read_bytes = std.c.fread(temp.ptr, 1, file_size, f);
-            if (read_bytes < file_size) return error.ReadFailed;
-
-            try buf.insert_raw(0, temp[0..read_bytes]);
+        if (temp.len > 0) {
+            try buf.insert_raw(0, temp);
         }
 
         buf.file_path = allocator.dupeZ(u8, path) catch null;
@@ -433,7 +420,7 @@ pub const Buffer = struct {
         buf.undo_tree.mark_saved();
 
         if (buf.file_path) |p| {
-            if (get_file_mtime(p.ptr)) |mt| {
+            if (get_file_mtime(p)) |mt| {
                 buf.mtime = mt;
             }
         }
@@ -454,7 +441,7 @@ pub const Buffer = struct {
 
     pub fn check_external_change(self: *const Buffer) bool {
         const p = self.file_path orelse return false;
-        const current_mt = get_file_mtime(p.ptr);
+        const current_mt = get_file_mtime(p);
         if (self.mtime == 0) {
             const has_ext = (current_mt != null);
             em_log("buffer.zig: check_external_change mtime==0 for '%s', on_disk=%d", p.ptr, if (has_ext) @as(c_int, 1) else @as(c_int, 0));
@@ -476,45 +463,32 @@ pub const Buffer = struct {
     pub fn reload(self: *Buffer) !void {
         const p = self.file_path orelse return error.FileNotFound;
         em_log("buffer.zig: reload() called for '%s'", p.ptr);
-        var f = std.c.fopen(p.ptr, "rb");
-        if (f == null) {
-            em_log("buffer.zig: fopen failed initially for '%s', retrying in 15ms...", p.ptr);
-            _ = usleep(15_000); // 15ms
-            f = std.c.fopen(p.ptr, "rb");
-        }
-        const file = f orelse {
-            em_log("buffer.zig: fopen failed completely for '%s'", p.ptr);
-            return error.FileNotFound;
-        };
-        defer _ = std.c.fclose(file);
+        const io = default_io();
 
-        _ = fseek(file, 0, 2); // SEEK_END
-        const size_long = ftell(file);
-        if (size_long < 0) return error.ReadFailed;
-        const file_size: usize = @intCast(size_long);
-        _ = fseek(file, 0, 0); // SEEK_SET
+        const temp = Io.Dir.cwd().readFileAlloc(io, p, self.allocator, .limited(128 * 1024 * 1024)) catch blk: {
+            em_log("buffer.zig: readFileAlloc failed initially for '%s', retrying in 15ms...", p.ptr);
+            io.sleep(.fromMilliseconds(15), .awake) catch {};
+            break :blk Io.Dir.cwd().readFileAlloc(io, p, self.allocator, .limited(128 * 1024 * 1024)) catch |err| switch (err) {
+                error.FileNotFound => {
+                    em_log("buffer.zig: readFileAlloc failed completely for '%s'", p.ptr);
+                    return error.FileNotFound;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.ReadFailed,
+            };
+        };
+        defer self.allocator.free(temp);
 
         try self.delete(0, self.len());
 
-        if (file_size > 0) {
-            const temp = try self.allocator.alloc(u8, file_size);
-            defer self.allocator.free(temp);
-
-            var read_bytes = std.c.fread(temp.ptr, 1, file_size, file);
-            if (read_bytes < file_size) {
-                _ = usleep(10_000);
-                _ = fseek(file, 0, 0);
-                read_bytes = std.c.fread(temp.ptr, 1, file_size, file);
-                if (read_bytes < file_size) return error.ReadFailed;
-            }
-
-            try self.insert_raw(0, temp[0..read_bytes]);
+        if (temp.len > 0) {
+            try self.insert_raw(0, temp);
         }
 
         self.is_dirty = false;
         self.undo_tree.mark_saved();
 
-        if (get_file_mtime(p.ptr)) |mt| {
+        if (get_file_mtime(p)) |mt| {
             self.mtime = mt;
             em_log("buffer.zig: reload() updated cached mtime to %lld for '%s'", @as(c_longlong, @truncate(mt)), p.ptr);
         }
@@ -528,25 +502,13 @@ pub const Buffer = struct {
 
     pub fn merge_with_disk(self: *const Buffer, allocator: Allocator) !patience_mod.MergeResult {
         const p = self.file_path orelse return error.FileNotFound;
-        const f = std.c.fopen(p.ptr, "rb") orelse return error.FileNotFound;
-        defer _ = std.c.fclose(f);
-
-        _ = fseek(f, 0, 2); // SEEK_END
-        const size_long = ftell(f);
-        if (size_long < 0) return error.ReadFailed;
-        const file_size: usize = @intCast(size_long);
-        _ = fseek(f, 0, 0); // SEEK_SET
-
-        var disk_content: []u8 = "";
-        if (file_size > 0) {
-            disk_content = try allocator.alloc(u8, file_size);
-            const read_bytes = std.c.fread(disk_content.ptr, 1, file_size, f);
-            if (read_bytes < file_size) {
-                allocator.free(disk_content);
-                return error.ReadFailed;
-            }
-        }
-        defer if (file_size > 0) allocator.free(disk_content);
+        const io = default_io();
+        const disk_content = Io.Dir.cwd().readFileAlloc(io, p, allocator, .limited(128 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return error.FileNotFound,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ReadFailed,
+        };
+        defer allocator.free(disk_content);
 
         const base_text = self.base_snapshot orelse "";
         const mine_text = try self.get_slice(allocator, 0, self.len());
@@ -731,7 +693,7 @@ test "test_buffer_save_to_file" {
     try buf.insert(0, "hello world\nline two\n");
     const test_path: [:0]const u8 = "/tmp/em_test_save.txt";
     try buf.save_to_file(test_path);
-    defer _ = std.c.unlink(test_path.ptr);
+    defer Io.Dir.cwd().deleteFile(testing.io, test_path) catch {};
 
     try testing.expect(!buf.is_dirty);
 
@@ -746,11 +708,11 @@ test "test_buffer_save_to_file" {
 
 test "test_buffer_load_from_file" {
     const test_path: [:0]const u8 = "/tmp/em_test_load.txt";
-    const f = std.c.fopen(test_path.ptr, "wb") orelse return error.FileOpenFailed;
-    const test_data = "file content\nline two\nline three";
-    _ = std.c.fwrite(test_data.ptr, 1, test_data.len, f);
-    _ = std.c.fclose(f);
-    defer _ = std.c.unlink(test_path.ptr);
+    try Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = test_path,
+        .data = "file content\nline two\nline three",
+    });
+    defer Io.Dir.cwd().deleteFile(testing.io, test_path) catch {};
 
     var buf = try Buffer.load_from_file(testing.allocator, test_path);
     defer buf.deinit();
@@ -764,11 +726,11 @@ test "test_buffer_load_from_file" {
 
 test "test_buffer_save_and_load_restores_undo_history" {
     const test_path: [:0]const u8 = "/tmp/em_persist_test.txt";
-    defer _ = std.c.unlink(test_path.ptr);
+    defer Io.Dir.cwd().deleteFile(testing.io, test_path) catch {};
 
     const undo_path = try undo_persist_mod.get_undo_path_for_file(testing.allocator, test_path);
     defer testing.allocator.free(undo_path);
-    defer _ = std.c.unlink(undo_path.ptr);
+    defer Io.Dir.cwd().deleteFile(testing.io, undo_path) catch {};
 
     {
         var buf1 = Buffer.init(testing.allocator);
@@ -829,7 +791,7 @@ test "test_buffer_mtime_cached_on_load_and_save" {
     try testing.expectEqualStrings("initial content\n", buf_loaded.base_snapshot.?);
     try testing.expect(!buf_loaded.check_external_change());
 
-    _ = std.c.unlink(test_path);
+    Io.Dir.cwd().deleteFile(testing.io, test_path) catch {};
 }
 
 test "test_buffer_check_external_change_detects_modification" {
@@ -842,16 +804,17 @@ test "test_buffer_check_external_change_detects_modification" {
     try testing.expect(!buf.check_external_change());
 
     // Wait slightly to ensure filesystem timestamp differs
-    _ = usleep(50_000);
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
 
     // Modify file externally on disk
-    const f = std.c.fopen(test_path, "wb") orelse return error.FileOpenFailed;
-    _ = std.c.fwrite("external edit\n".ptr, 1, 14, f);
-    _ = std.c.fclose(f);
+    try Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = test_path,
+        .data = "external edit\n",
+    });
 
     try testing.expect(buf.check_external_change());
 
-    _ = std.c.unlink(test_path);
+    Io.Dir.cwd().deleteFile(testing.io, test_path) catch {};
 }
 
 test "test_buffer_reload_clears_dirty_and_updates_snapshot" {
@@ -862,12 +825,13 @@ test "test_buffer_reload_clears_dirty_and_updates_snapshot" {
     try buf.insert(0, "before reload\n");
     try buf.save_to_file(test_path);
 
-    _ = usleep(50_000);
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
 
     // External overwrite
-    const f = std.c.fopen(test_path, "wb") orelse return error.FileOpenFailed;
-    _ = std.c.fwrite("reloaded content\n".ptr, 1, 17, f);
-    _ = std.c.fclose(f);
+    try Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = test_path,
+        .data = "reloaded content\n",
+    });
 
     try buf.insert(0, "local dirty change\n");
     try testing.expect(buf.is_dirty);
@@ -880,7 +844,7 @@ test "test_buffer_reload_clears_dirty_and_updates_snapshot" {
     try testing.expectEqualStrings("reloaded content\n", slice);
     try testing.expect(!buf.check_external_change());
 
-    _ = std.c.unlink(test_path);
+    Io.Dir.cwd().deleteFile(testing.io, test_path) catch {};
 }
 
 test "test_buffer_diff3_with_disk" {
@@ -891,12 +855,13 @@ test "test_buffer_diff3_with_disk" {
     try buf.insert(0, "line 1\n");
     try buf.save_to_file(test_path);
 
-    _ = usleep(50_000);
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
 
     // External disk modification
-    const f = std.c.fopen(test_path, "wb") orelse return error.FileOpenFailed;
-    _ = std.c.fwrite("line 1 external\n".ptr, 1, 16, f);
-    _ = std.c.fclose(f);
+    try Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = test_path,
+        .data = "line 1 external\n",
+    });
 
     // Local in-memory edit
     try buf.delete(0, buf.len());
@@ -908,5 +873,5 @@ test "test_buffer_diff3_with_disk" {
     try testing.expect(res.has_conflicts);
     try testing.expect(std.mem.indexOf(u8, res.text, "<<<<<<< In-Memory") != null);
 
-    _ = std.c.unlink(test_path);
+    Io.Dir.cwd().deleteFile(testing.io, test_path) catch {};
 }

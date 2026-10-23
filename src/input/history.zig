@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 pub const MAX_ENTRIES: usize = 100;
@@ -111,28 +112,15 @@ pub const HistoryCategory = struct {
     }
 };
 
-extern "c" fn mkdir(path: [*c]const u8, mode: c_uint) c_int;
-extern "c" fn unlink(path: [*c]const u8) c_int;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
-extern "c" fn ftell(stream: *std.c.FILE) c_long;
-const SEEK_SET: c_int = 0;
-const SEEK_END: c_int = 2;
+
+fn default_io() Io {
+    return Io.Threaded.global_single_threaded.io();
+}
 
 pub fn ensure_dir_recursive(path: []const u8) void {
-    var buf: [1024]u8 = undefined;
-    if (path.len >= buf.len) return;
-
-    for (path, 0..) |ch, i| {
-        buf[i] = ch;
-        if (ch == '/' and i > 0) {
-            buf[i] = 0;
-            _ = mkdir(&buf, 0o755);
-            buf[i] = '/';
-        }
-    }
-    buf[path.len] = 0;
-    _ = mkdir(&buf, 0o755);
+    if (path.len == 0) return;
+    Io.Dir.cwd().createDirPath(default_io(), path) catch {};
 }
 
 const HistoryJson = struct {
@@ -173,34 +161,16 @@ pub const HistoryStore = struct {
         const json_str = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(data, .{ .whitespace = .indent_2 })});
         defer allocator.free(json_str);
 
-        const path_z = try allocator.dupeZ(u8, path);
-        defer allocator.free(path_z);
-
-        const f = std.c.fopen(path_z.ptr, "wb") orelse return error.FileOpenFailed;
-        defer _ = std.c.fclose(f);
-
-        if (std.c.fwrite(json_str.ptr, 1, json_str.len, f) != json_str.len) {
-            return error.WriteFailed;
-        }
+        Io.Dir.cwd().writeFile(default_io(), .{
+            .sub_path = path,
+            .data = json_str,
+        }) catch return error.WriteFailed;
     }
 
     pub fn load_from_file(self: *HistoryStore, allocator: Allocator, path: []const u8) !void {
-        const path_z = try allocator.dupeZ(u8, path);
-        defer allocator.free(path_z);
-
-        const f = std.c.fopen(path_z.ptr, "rb") orelse return;
-        defer _ = std.c.fclose(f);
-
-        _ = fseek(f, 0, SEEK_END);
-        const sz = ftell(f);
-        if (sz <= 0 or sz > 1024 * 1024) return;
-        _ = fseek(f, 0, SEEK_SET);
-
-        const buf = try allocator.alloc(u8, @intCast(sz));
+        const buf = Io.Dir.cwd().readFileAlloc(default_io(), path, allocator, .limited(1024 * 1024)) catch return;
         defer allocator.free(buf);
-
-        const read_bytes = std.c.fread(buf.ptr, 1, buf.len, f);
-        if (read_bytes != buf.len) return;
+        if (buf.len == 0) return;
 
         const parsed = std.json.parseFromSlice(HistoryJson, allocator, buf, .{}) catch return;
         defer parsed.deinit();
@@ -300,7 +270,7 @@ test "test_history_prefix_matching" {
 
 test "test_history_json_serialization_roundtrip" {
     const tmp_path = "history_test_roundtrip.json";
-    defer _ = unlink(tmp_path);
+    defer Io.Dir.cwd().deleteFile(testing.io, tmp_path) catch {};
 
     var store = HistoryStore{};
     store.commands.add("w /tmp/test.txt");
