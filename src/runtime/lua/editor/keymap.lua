@@ -119,7 +119,10 @@ function editor.keymap.dispatch(mode, seq)
 
     local rhs = entry.rhs
     if type(rhs) == "function" then
-        rhs()
+        local res = rhs()
+        if res == false then
+            return false, "rejected"
+        end
         return true, "executed"
     elseif type(rhs) == "string" then
         local cmd = rhs:match("^:(.*)<[cC][rR]>$") or rhs:match("^:(.*)\n$")
@@ -152,7 +155,10 @@ function editor.keymap.feed(mode, key)
         return "pending", pending_seq
     elseif status == "exact" or status == "exact_or_prefix" then
         pending_seq = ""
-        editor.keymap.dispatch(mode, test_seq)
+        local ok, _ = editor.keymap.dispatch(mode, test_seq)
+        if ok == false then
+            return "nomatch", key
+        end
         return "matched", test_seq
     else
         local prev = pending_seq

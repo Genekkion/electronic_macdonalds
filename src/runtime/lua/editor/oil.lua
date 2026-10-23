@@ -109,9 +109,15 @@ function M.select_entry()
 
     local snap = M.snapshots[cur_buf:get_id()]
     local base_dir = snap and snap.dir_path or ""
+    if base_dir ~= "" and not base_dir:match("/$") then
+        base_dir = base_dir .. "/"
+    end
 
-    local full_path = base_dir .. line_text
-    if line_text:match("/$") or editor.is_dir(full_path) then
+    local clean_entry = line_text:gsub("^/+", "")
+    local full_path = base_dir .. clean_entry
+    full_path = full_path:gsub("([^/])/+", "%1/")
+
+    if clean_entry:match("/$") or editor.is_dir(full_path) then
         return M.open(full_path) ~= nil
     else
         return editor.edit_path(full_path)

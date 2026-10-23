@@ -1596,6 +1596,29 @@ test "test_lua_oil_navigation" {
     try run_lua_test(script);
 }
 
+test "test_lua_oil_navigation_target_dir" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_target_test/sub1", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_target_test/sub2", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_target_test", true) end)
+        \\editor.fs_mkdir("/tmp/em_oil_target_test")
+        \\editor.fs_mkdir("/tmp/em_oil_target_test/sub1")
+        \\editor.fs_mkdir("/tmp/em_oil_target_test/sub2")
+        \\
+        \\editor.dispatch_command(":e /tmp/em_oil_target_test")
+        \\-- sub1/ is at line 0, sub2/ is at line 1
+        \\editor.set_cursor(1, 0)
+        \\editor.oil.select_entry()
+        \\local cur = editor.get_current_buffer()
+        \\assert(cur:get_path() == "/tmp/em_oil_target_test/sub2/")
+        \\
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_target_test/sub1", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_target_test/sub2", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_target_test", true) end)
+    ;
+    try run_lua_test(script);
+}
+
 test "test_lua_oil_save_rename" {
     const script =
         \\pcall(function() editor.fs_delete("/tmp/em_oil_test/sub", true) end)
@@ -1673,6 +1696,35 @@ test "test_lua_oil_save_create" {
         \\pcall(function() editor.fs_delete("/tmp/em_oil_test/alpha.txt", false) end)
         \\pcall(function() editor.fs_delete("/tmp/em_oil_test/gamma.txt", false) end)
         \\pcall(function() editor.fs_delete("/tmp/em_oil_test", true) end)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_oil_leader_g_keymap" {
+    const script =
+        \\assert(editor.g.mapleader == " ")
+        \\local entry = editor.keymap.get("n", " g")
+        \\assert(entry ~= nil)
+        \\assert(type(entry.rhs) == "function")
+        \\
+        \\entry.rhs()
+        \\local cur = editor.get_current_buffer()
+        \\assert(cur ~= nil)
+        \\assert(editor.oil.is_oil_buffer(cur) == true)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_dash_in_file_does_not_trigger_oil" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\buf:set_path("some_file.txt")
+        \\editor.set_current_buffer(buf)
+        \\assert(editor.oil.is_oil_buffer(buf) == false)
+        \\
+        \\local status, val = editor.keymap.feed("n", "-")
+        \\assert(status == "nomatch")
+        \\assert(editor.oil.is_oil_buffer(editor.get_current_buffer()) == false)
     ;
     try run_lua_test(script);
 }

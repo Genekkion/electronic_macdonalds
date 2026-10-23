@@ -333,6 +333,7 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
 
     // Intercept keys via Lua Keymap Engine if not in command-line mode
     if (g_editor.mode != .command_line and g_lua != null) {
+        root.lua.set_internal_cursor(g_editor.cursor.line, g_editor.cursor.col);
         const feed_res = feedKeyToLuaKeymap(
             g_editor.mode,
             if (ev.code == .character) ev.char else null,
@@ -353,6 +354,15 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
                             }
                         }
                     }
+                }
+                const cur_info = root.lua.get_internal_cursor();
+                if (cur_info.updated) {
+                    g_editor.cursor.line = cur_info.line;
+                    g_editor.cursor.col = cur_info.col;
+                    g_editor.cursor.desired_col = cur_info.col;
+                }
+                if (g_lua != null) {
+                    root.lua.set_internal_cursor(g_editor.cursor.line, g_editor.cursor.col);
                 }
                 updateUi();
                 return;
@@ -379,6 +389,10 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
     const prev_mode = g_editor.mode;
     g_editor.handle_key(buf, ev) catch {};
 
+    if (g_lua != null) {
+        root.lua.set_internal_cursor(g_editor.cursor.line, g_editor.cursor.col);
+    }
+
     if (g_editor.mode != prev_mode and g_lua != null) {
         root.events.emit_event(g_lua, .mode_changed, .{
             .from_mode = prev_mode.to_str(),
@@ -402,13 +416,6 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
             c.lua_pop(L, 2);
         }
 
-        const cur_info = root.lua.get_internal_cursor();
-        if (cur_info.updated) {
-            g_editor.cursor.line = cur_info.line;
-            g_editor.cursor.col = cur_info.col;
-            g_editor.cursor.desired_col = cur_info.col;
-        }
-
         if (root.lua.is_quit_requested()) {
             saveHistory(std.heap.c_allocator);
             std.c.exit(0);
@@ -424,6 +431,15 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
                 }
             }
         }
+
+        const cur_info = root.lua.get_internal_cursor();
+        if (cur_info.updated) {
+            g_editor.cursor.line = cur_info.line;
+            g_editor.cursor.col = cur_info.col;
+            g_editor.cursor.desired_col = cur_info.col;
+        }
+
+        root.lua.set_internal_cursor(g_editor.cursor.line, g_editor.cursor.col);
     }
 
     updateUi();

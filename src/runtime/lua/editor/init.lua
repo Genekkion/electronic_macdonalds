@@ -2,6 +2,8 @@
 -- Core editor runtime initialization
 
 editor = editor or {}
+editor.g = editor.g or {}
+editor.g.mapleader = editor.g.mapleader or " "
 editor._last_message = ""
 editor._last_error = ""
 
@@ -78,15 +80,33 @@ editor.keymap.set("n", "<leader>bp", ":bp<CR>")
 -- Oil filesystem buffer keymaps
 editor.keymap.set("n", "-", function()
     if editor.oil and editor.oil.is_oil_buffer(editor.get_current_buffer()) then
-        editor.oil.parent_dir()
-    else
-        editor.oil.open(".")
+        return editor.oil.parent_dir()
     end
+    return false
 end)
 
 editor.keymap.set("n", "<CR>", function()
     if editor.oil and editor.oil.is_oil_buffer(editor.get_current_buffer()) then
-        editor.oil.select_entry()
+        return editor.oil.select_entry()
+    end
+    return false
+end)
+
+editor.keymap.set("n", "<leader>gg", function()
+    if not editor.oil then return end
+    local cur_buf = editor.get_current_buffer()
+    if cur_buf and editor.oil.is_oil_buffer(cur_buf) then
+        editor.oil.parent_dir()
+    else
+        local path = cur_buf and cur_buf:get_path()
+        if path and path ~= "" and not path:match("^oil://") then
+            local dir = path:match("^(.-)/[^/]+$")
+            if dir and dir ~= "" and editor.is_dir(dir) then
+                editor.oil.open(dir)
+                return
+            end
+        end
+        editor.oil.open(".")
     end
 end)
 
