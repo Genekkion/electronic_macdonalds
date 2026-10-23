@@ -25,6 +25,17 @@ void macos_window_attach_editor_view(
 void macos_window_set_cursor(void *win, int line, int col);
 void macos_window_set_cursor_mode(void *win, int line, int col, int mode);
 void macos_window_set_status_line(void *win, const char *status_text);
+void macos_window_set_selection(
+    void *win,
+    int start_line,
+    int start_col,
+    int end_line,
+    int end_col,
+    bool is_active,
+    bool is_line
+);
+void macos_clipboard_set(const char *text, int len);
+const char *macos_clipboard_get(int *out_len);
 void macos_window_redraw(void *win);
 bool macos_app_poll_events(void);
 void macos_app_run(void);

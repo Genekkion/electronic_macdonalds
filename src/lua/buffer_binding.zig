@@ -4,6 +4,7 @@ const c = @import("c.zig").c;
 const result = @import("result.zig");
 const Buffer = @import("../buffer/buffer.zig").Buffer;
 const BufferRegistry = @import("../buffer/registry.zig").BufferRegistry;
+const clipboard = @import("../platform/clipboard.zig");
 
 pub const metatable_name = "ElectronicMacdonalds.BufferHandle";
 
@@ -15,6 +16,7 @@ var global_registry: ?*BufferRegistry = null;
 
 const lua_editor_init = @embedFile("../runtime/lua/editor/init.lua");
 const lua_editor_commands = @embedFile("../runtime/lua/editor/commands.lua");
+const lua_editor_keymap = @embedFile("../runtime/lua/editor/keymap.lua");
 
 pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
     global_registry = registry;
@@ -45,6 +47,16 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
     c.lua_newtable(L);
     c.lua_setfield(L, -2, "_keybindings");
 
+    // Create clipboard table: editor.clipboard = { get = ..., set = ... }
+    c.lua_newtable(L);
+    const clipboard_funcs = [_]c.luaL_Reg{
+        .{ .name = "get", .func = lua_clipboard_get },
+        .{ .name = "set", .func = lua_clipboard_set },
+        .{ .name = null, .func = null },
+    };
+    c.luaL_setfuncs(L, &clipboard_funcs, 0);
+    c.lua_setfield(L, -2, "clipboard");
+
     const editor_funcs = [_]c.luaL_Reg{
         .{ .name = "create_buffer", .func = lua_create_buffer },
         .{ .name = "close_buffer", .func = lua_close_buffer },
@@ -66,6 +78,9 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
 
     _ = c.luaL_loadbufferx(L, lua_editor_commands.ptr, lua_editor_commands.len, "@editor.commands", null);
     c.lua_setfield(L, -2, "editor.commands");
+
+    _ = c.luaL_loadbufferx(L, lua_editor_keymap.ptr, lua_editor_keymap.len, "@editor.keymap", null);
+    c.lua_setfield(L, -2, "editor.keymap");
 
     _ = c.luaL_loadbufferx(L, lua_editor_init.ptr, lua_editor_init.len, "@editor.init", null);
     c.lua_setfield(L, -2, "editor.init");
@@ -120,6 +135,25 @@ fn lua_dispatch_key_combo(L: ?*c.lua_State) callconv(.c) c_int {
 
     c.lua_pop(L, 3); // pop nil/value, _keybindings, editor
     return result.push_error(L, "UNBOUND_KEY", "no binding for key combo");
+}
+
+fn lua_clipboard_get(L: ?*c.lua_State) callconv(.c) c_int {
+    if (clipboard.get()) |text| {
+        _ = c.lua_pushlstring(L, text.ptr, text.len);
+        return 1;
+    }
+    c.lua_pushnil(L);
+    return 1;
+}
+
+fn lua_clipboard_set(L: ?*c.lua_State) callconv(.c) c_int {
+    var len: usize = 0;
+    const str = c.lua_tolstring(L, 1, &len);
+    if (str != null) {
+        clipboard.set(str[0..len]);
+        return result.push_success_bool(L, true);
+    }
+    return result.push_error(L, "INVALID_ARGUMENT", "expected (text: string)");
 }
 
 fn get_handle_id(L: ?*c.lua_State, idx: c_int) ?u64 {
@@ -657,6 +691,92 @@ test "test_lua_builtin_commands_write_and_quit" {
         \\editor.dispatch_command(":q")
         \\assert(editor.is_quit_requested() == true)
         \\os.remove("/tmp/em_builtin_write.txt")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_keymap_set_and_lookup" {
+    const script =
+        \\local called = false
+        \\editor.keymap.set("n", "gh", function() called = true end)
+        \\local entry = editor.keymap.get("n", "gh")
+        \\assert(entry ~= nil)
+        \\assert(type(entry.rhs) == "function")
+        \\entry.rhs()
+        \\assert(called == true)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_keymap_leader_key_expansion" {
+    const script =
+        \\editor.g.mapleader = ","
+        \\editor.keymap.set("n", "<leader>w", ":w<CR>")
+        \\local entry = editor.keymap.get("n", ",w")
+        \\assert(entry ~= nil)
+        \\assert(entry.rhs == ":w<CR>")
+        \\
+        \\editor.g.mapleader = " "
+        \\editor.keymap.set("n", "<leader>q", ":q<CR>")
+        \\local entry_sp = editor.keymap.get("n", " q")
+        \\assert(entry_sp ~= nil)
+        \\assert(entry_sp.rhs == ":q<CR>")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_keymap_command_string_dispatch" {
+    const script =
+        \\editor.keymap.set("n", "gw", ":echo keymap_echo_test<CR>")
+        \\local ok, kind = editor.keymap.dispatch("n", "gw")
+        \\assert(ok == true)
+        \\assert(kind == "command")
+        \\assert(editor.get_last_message() == "keymap_echo_test")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_keymap_function_callback_dispatch" {
+    const script =
+        \\local count = 0
+        \\editor.keymap.set("n", "gx", function() count = count + 1 end)
+        \\local ok, kind = editor.keymap.dispatch("n", "gx")
+        \\assert(ok == true)
+        \\assert(kind == "executed")
+        \\assert(count == 1)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_keymap_multi_key_sequence" {
+    const script =
+        \\local triggered = false
+        \\editor.g.mapleader = " "
+        \\editor.keymap.set("n", "<leader>ff", function() triggered = true end)
+        \\
+        \\local res1, val1 = editor.keymap.feed("n", " ")
+        \\assert(res1 == "pending")
+        \\assert(val1 == " ")
+        \\
+        \\local res2, val2 = editor.keymap.feed("n", "f")
+        \\assert(res2 == "pending")
+        \\assert(val2 == " f")
+        \\
+        \\local res3, val3 = editor.keymap.feed("n", "f")
+        \\assert(res3 == "matched")
+        \\assert(triggered == true)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_clipboard_get_and_set" {
+    clipboard.enable_mock(true);
+    defer clipboard.enable_mock(false);
+
+    const script =
+        \\editor.clipboard.set("lua clipboard text")
+        \\local text = editor.clipboard.get()
+        \\assert(text == "lua clipboard text")
     ;
     try run_lua_test(script);
 }

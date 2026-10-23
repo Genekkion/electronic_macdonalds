@@ -29,5 +29,11 @@ end
 
 -- Load command subsystem
 require("editor.commands")
+-- Load keymap subsystem
+require("editor.keymap")
+
+-- Default keymaps
+editor.keymap.set("n", "<leader>w", ":w<CR>")
+editor.keymap.set("n", "<leader>q", ":q<CR>")
 
 return editor

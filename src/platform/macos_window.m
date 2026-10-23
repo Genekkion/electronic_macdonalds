@@ -32,6 +32,12 @@
 @property (nonatomic, assign) int cursorCol;
 @property (nonatomic, assign) int mode;
 @property (nonatomic, copy) NSString *statusText;
+@property (nonatomic, assign) BOOL hasSelection;
+@property (nonatomic, assign) BOOL isLineSelection;
+@property (nonatomic, assign) int selStartLine;
+@property (nonatomic, assign) int selStartCol;
+@property (nonatomic, assign) int selEndLine;
+@property (nonatomic, assign) int selEndCol;
 @property (nonatomic, assign) BOOL cursorVisible;
 @property (nonatomic, strong) NSTimer *blinkTimer;
 @property (nonatomic, assign) CTFontRef font;
@@ -146,7 +152,34 @@
         NSForegroundColorAttributeName: textColor
     };
 
-    // 2. Draw lines of text
+    // 2. Draw visual selection highlight if active
+    if (_hasSelection) {
+        CGContextSetRGBFillColor(context, 0.22, 0.35, 0.55, 0.65);
+        int startL = _selStartLine;
+        int endL = _selEndLine;
+        for (int i = startL; i <= endL && i < maxLine; i++) {
+            NSRect selRect;
+            if (_isLineSelection) {
+                selRect = NSMakeRect(0, i * _lineHeight, self.bounds.size.width, _lineHeight);
+            } else if (startL == endL) {
+                CGFloat startX = 10.0 + _selStartCol * _charWidth;
+                CGFloat width = (_selEndCol - _selStartCol + 1) * _charWidth;
+                selRect = NSMakeRect(startX, i * _lineHeight, width, _lineHeight);
+            } else if (i == startL) {
+                CGFloat startX = 10.0 + _selStartCol * _charWidth;
+                CGFloat width = self.bounds.size.width - startX;
+                selRect = NSMakeRect(startX, i * _lineHeight, width, _lineHeight);
+            } else if (i == endL) {
+                CGFloat width = 10.0 + (_selEndCol + 1) * _charWidth;
+                selRect = NSMakeRect(0, i * _lineHeight, width, _lineHeight);
+            } else {
+                selRect = NSMakeRect(0, i * _lineHeight, self.bounds.size.width, _lineHeight);
+            }
+            CGContextFillRect(context, selRect);
+        }
+    }
+
+    // 3. Draw lines of text
     for (int i = 0; i < maxLine; i++) {
         int len = 0;
         const char *bytes = _getLineCb(_ctx, i, &len);
@@ -310,6 +343,74 @@ void macos_window_set_status_line(void *win, const char *status_text) {
             view.statusText = status_text ? [NSString stringWithUTF8String:status_text] : @"";
             [view setNeedsDisplay:YES];
         }
+    }
+}
+
+void macos_window_set_selection(
+    void *win,
+    int start_line,
+    int start_col,
+    int end_line,
+    int end_col,
+    bool is_active,
+    bool is_line
+) {
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win;
+        if ([[window contentView] isKindOfClass:[EditorView class]]) {
+            EditorView *view = (EditorView *)[window contentView];
+            view.hasSelection = is_active;
+            view.isLineSelection = is_line;
+            view.selStartLine = start_line;
+            view.selStartCol = start_col;
+            view.selEndLine = end_line;
+            view.selEndCol = end_col;
+            [view setNeedsDisplay:YES];
+        }
+    }
+}
+
+void macos_clipboard_set(const char *text, int len) {
+    @autoreleasepool {
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        [pb clearContents];
+        if (text && len > 0) {
+            NSString *str = [[NSString alloc] initWithBytes:text length:len encoding:NSUTF8StringEncoding];
+            if (str) {
+                [pb setString:str forType:NSPasteboardTypeString];
+            }
+        }
+    }
+}
+
+static char *g_clipboard_cache = NULL;
+
+const char *macos_clipboard_get(int *out_len) {
+    @autoreleasepool {
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        NSString *str = [pb stringForType:NSPasteboardTypeString];
+        if (!str) {
+            if (out_len) *out_len = 0;
+            return NULL;
+        }
+        NSData *data = [str dataUsingEncoding:NSUTF8StringEncoding];
+        if (!data || data.length == 0) {
+            if (out_len) *out_len = 0;
+            return NULL;
+        }
+        if (g_clipboard_cache) {
+            free(g_clipboard_cache);
+            g_clipboard_cache = NULL;
+        }
+        g_clipboard_cache = (char *)malloc(data.length + 1);
+        if (!g_clipboard_cache) {
+            if (out_len) *out_len = 0;
+            return NULL;
+        }
+        memcpy(g_clipboard_cache, data.bytes, data.length);
+        g_clipboard_cache[data.length] = '\0';
+        if (out_len) *out_len = (int)data.length;
+        return g_clipboard_cache;
     }
 }
 

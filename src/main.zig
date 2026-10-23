@@ -16,6 +16,19 @@ var g_line_buffer: [4096]u8 = undefined;
 var g_lua: ?*c.lua_State = null;
 var g_registry: ?*root.BufferRegistry = null;
 
+fn macosClipboardSet(text: []const u8) void {
+    macos.macos_clipboard_set(text.ptr, @intCast(text.len));
+}
+
+fn macosClipboardGet() ?[]const u8 {
+    var out_len: c_int = 0;
+    const ptr = macos.macos_clipboard_get(&out_len);
+    if (ptr != null and out_len > 0) {
+        return ptr[0..@intCast(out_len)];
+    }
+    return null;
+}
+
 fn getLuaStatusMessage(allocator: std.mem.Allocator) ?[:0]u8 {
     const L = g_lua orelse return null;
     _ = c.lua_getglobal(L, "editor");
@@ -33,6 +46,87 @@ fn getLuaStatusMessage(allocator: std.mem.Allocator) ?[:0]u8 {
     return null;
 }
 
+fn getLuaPendingKey(allocator: std.mem.Allocator) ?[:0]u8 {
+    const L = g_lua orelse return null;
+    _ = c.lua_getglobal(L, "editor");
+    _ = c.lua_getfield(L, -1, "keymap");
+    _ = c.lua_getfield(L, -1, "get_pending");
+    if (c.lua_pcallk(L, 0, 1, 0, 0, null) == 0) {
+        var len: usize = 0;
+        const str = c.lua_tolstring(L, -1, &len);
+        if (str != null and len > 0) {
+            const res = allocator.dupeZ(u8, str[0..len]) catch null;
+            c.lua_pop(L, 3);
+            return res;
+        }
+    }
+    c.lua_pop(L, 3);
+    return null;
+}
+
+const FeedResult = enum { matched, pending, nomatch };
+
+fn feedKeyToLuaKeymap(mode: root.mode.Mode, key_char: ?u8, key_code: root.event.KeyCode) FeedResult {
+    const L = g_lua orelse return .nomatch;
+
+    const mode_str: [*c]const u8 = switch (mode) {
+        .normal => "n",
+        .insert => "i",
+        .visual, .visual_line => "v",
+        .command_line => "c",
+    };
+
+    var key_buf: [4]u8 = undefined;
+    var key_len: usize = 0;
+    if (key_char) |ch| {
+        key_buf[0] = ch;
+        key_len = 1;
+    } else {
+        switch (key_code) {
+            .escape => {
+                key_buf[0] = 0x1b;
+                key_len = 1;
+            },
+            .enter => {
+                key_buf[0] = '\n';
+                key_len = 1;
+            },
+            .backspace => {
+                key_buf[0] = 0x08;
+                key_len = 1;
+            },
+            .tab => {
+                key_buf[0] = '\t';
+                key_len = 1;
+            },
+            else => return .nomatch,
+        }
+    }
+
+    _ = c.lua_getglobal(L, "editor");
+    _ = c.lua_getfield(L, -1, "keymap");
+    _ = c.lua_getfield(L, -1, "feed");
+    _ = c.lua_pushstring(L, mode_str);
+    _ = c.lua_pushlstring(L, &key_buf, key_len);
+
+    if (c.lua_pcallk(L, 2, 2, 0, 0, null) == 0) {
+        const status_str = c.lua_tolstring(L, -2, null);
+        var result_enum: FeedResult = .nomatch;
+        if (status_str != null) {
+            if (std.mem.eql(u8, std.mem.span(status_str), "matched")) {
+                result_enum = .matched;
+            } else if (std.mem.eql(u8, std.mem.span(status_str), "pending")) {
+                result_enum = .pending;
+            }
+        }
+        c.lua_pop(L, 4); // pop status, val, keymap, editor
+        return result_enum;
+    } else {
+        c.lua_pop(L, 3); // pop err, keymap, editor
+        return .nomatch;
+    }
+}
+
 fn updateUi() void {
     const win = g_window orelse return;
     const buf = g_active_buffer orelse return;
@@ -40,7 +134,7 @@ fn updateUi() void {
     const mode_int: c_int = switch (g_editor.mode) {
         .normal => 0,
         .insert => 1,
-        .visual => 2,
+        .visual, .visual_line => 2,
         .command_line => 3,
     };
 
@@ -51,6 +145,20 @@ fn updateUi() void {
         mode_int,
     );
 
+    if (g_editor.get_selection_range(buf)) |sel| {
+        macos.macos_window_set_selection(
+            win,
+            @intCast(sel.start_line),
+            @intCast(sel.start_col),
+            @intCast(sel.end_line),
+            @intCast(sel.end_col),
+            true,
+            sel.is_line,
+        );
+    } else {
+        macos.macos_window_set_selection(win, 0, 0, 0, 0, false, false);
+    }
+
     if (g_editor.mode == .command_line) {
         const cmd_str = g_editor.get_cmd_line();
         const status = root.status_line.format_command_line(
@@ -60,21 +168,35 @@ fn updateUi() void {
         defer std.heap.c_allocator.free(status);
         macos.macos_window_set_status_line(win, status.ptr);
     } else {
-        const maybe_lua_msg = getLuaStatusMessage(std.heap.c_allocator);
-        if (maybe_lua_msg) |msg| {
-            defer std.heap.c_allocator.free(msg);
-            macos.macos_window_set_status_line(win, msg.ptr);
+        const maybe_pending = getLuaPendingKey(std.heap.c_allocator);
+        if (maybe_pending) |p| {
+            defer std.heap.c_allocator.free(p);
+            const text = std.fmt.allocPrint(std.heap.c_allocator, "-- KEYMAP: {s} --", .{p}) catch null;
+            if (text) |t| {
+                defer std.heap.c_allocator.free(t);
+                const status = std.heap.c_allocator.dupeZ(u8, t) catch null;
+                if (status) |st| {
+                    defer std.heap.c_allocator.free(st);
+                    macos.macos_window_set_status_line(win, st.ptr);
+                }
+            }
         } else {
-            const status = format_status_line(
-                std.heap.c_allocator,
-                g_editor.mode,
-                "scratch.lua",
-                g_editor.cursor.line,
-                g_editor.cursor.col,
-                buf.line_count(),
-            ) catch return;
-            defer std.heap.c_allocator.free(status);
-            macos.macos_window_set_status_line(win, status.ptr);
+            const maybe_lua_msg = getLuaStatusMessage(std.heap.c_allocator);
+            if (maybe_lua_msg) |msg| {
+                defer std.heap.c_allocator.free(msg);
+                macos.macos_window_set_status_line(win, msg.ptr);
+            } else {
+                const status = format_status_line(
+                    std.heap.c_allocator,
+                    g_editor.mode,
+                    "scratch.lua",
+                    g_editor.cursor.line,
+                    g_editor.cursor.col,
+                    buf.line_count(),
+                ) catch return;
+                defer std.heap.c_allocator.free(status);
+                macos.macos_window_set_status_line(win, status.ptr);
+            }
         }
     }
 }
@@ -126,6 +248,36 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         },
     }
 
+    // Intercept keys via Lua Keymap Engine if not in command-line mode
+    if (g_editor.mode != .command_line and g_lua != null) {
+        const feed_res = feedKeyToLuaKeymap(
+            g_editor.mode,
+            if (ev.code == .character) ev.char else null,
+            ev.code,
+        );
+        switch (feed_res) {
+            .matched => {
+                if (root.lua.is_quit_requested()) {
+                    std.c.exit(0);
+                }
+                if (root.lua.get_active_buffer_id()) |new_id| {
+                    if (g_registry) |reg| {
+                        if (reg.get(new_id)) |new_buf| {
+                            g_active_buffer = new_buf;
+                        }
+                    }
+                }
+                updateUi();
+                return;
+            },
+            .pending => {
+                updateUi();
+                return;
+            },
+            .nomatch => {},
+        }
+    }
+
     const was_cmd = (g_editor.mode == .command_line);
     var cmd_copy: [256]u8 = undefined;
     var cmd_len: usize = 0;
@@ -169,6 +321,9 @@ pub fn main() !void {
 
     std.debug.print("Initializing Electronic Macdonalds...\n", .{});
 
+    // Initialize system clipboard handlers
+    root.clipboard.set_handlers(macosClipboardSet, macosClipboardGet);
+
     // 1. Initialize Buffer Registry
     var registry = root.BufferRegistry.init(allocator);
     defer registry.deinit();
@@ -182,8 +337,9 @@ pub fn main() !void {
     try buf.insert(0,
         \\-- Welcome to Electronic Macdonalds (Native Zig Core + Lua Engine)
         \\-- Vim modal keybindings active:
-        \\--   Normal Mode: h/j/k/l, 0/$, w/b, x, dd, i, a, o
-        \\--   Insert Mode: typing, Enter, Backspace, Esc
+        \\--   Normal Mode: h/j/k/l, 0/$, w/b, x, dd, i, a, o, p/P
+        \\--   Visual Mode: v (char-wise), V (line-wise), y (yank), d (delete)
+        \\--   Leader Maps: <Space>w (Save), <Space>q (Quit)
         \\--   Command Mode (:):
         \\--     :w [path]   (Save buffer to disk)
         \\--     :q          (Quit editor, checks dirty flag)

@@ -4,11 +4,12 @@ pub const Mode = enum {
     normal,
     insert,
     visual,
+    visual_line,
     command_line,
 
     pub fn cursor_width(self: Mode, char_width: f32) f32 {
         return switch (self) {
-            .normal, .visual => char_width,
+            .normal, .visual, .visual_line => char_width,
             .insert, .command_line => 2.0,
         };
     }
@@ -18,6 +19,7 @@ pub const Mode = enum {
             .normal => "-- NORMAL --",
             .insert => "-- INSERT --",
             .visual => "-- VISUAL --",
+            .visual_line => "-- VISUAL LINE --",
             .command_line => "-- COMMAND --",
         };
     }

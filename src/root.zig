@@ -17,6 +17,7 @@ pub const keymap = @import("input/keymap.zig");
 pub const cursor = @import("input/cursor.zig");
 pub const mode = @import("input/mode.zig");
 pub const vim = @import("input/vim.zig");
+pub const clipboard = @import("platform/clipboard.zig");
 
 test {
     std.testing.refAllDecls(@This());
@@ -29,4 +30,5 @@ test {
     _ = @import("input/cursor.zig");
     _ = @import("input/mode.zig");
     _ = @import("input/vim.zig");
+    _ = @import("platform/clipboard.zig");
 }
