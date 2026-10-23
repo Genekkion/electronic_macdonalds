@@ -127,9 +127,36 @@ fn feedKeyToLuaKeymap(mode: root.mode.Mode, key_char: ?u8, key_code: root.event.
     }
 }
 
+fn getLuaOptionBool(opt_name: [:0]const u8, default_val: bool) bool {
+    const L = g_lua orelse return default_val;
+    _ = c.lua_getglobal(L, "editor");
+    if (c.lua_istable(L, -1)) {
+        _ = c.lua_getfield(L, -1, "get_option");
+        if (c.lua_isfunction(L, -1)) {
+            _ = c.lua_pushstring(L, opt_name.ptr);
+            if (c.lua_pcallk(L, 1, 1, 0, 0, null) == 0) {
+                if (c.lua_isboolean(L, -1)) {
+                    const res = (c.lua_toboolean(L, -1) != 0);
+                    c.lua_pop(L, 2);
+                    return res;
+                }
+                c.lua_pop(L, 1);
+            }
+        } else {
+            c.lua_pop(L, 1);
+        }
+    }
+    c.lua_pop(L, 1);
+    return default_val;
+}
+
 fn updateUi() void {
     const win = g_window orelse return;
     const buf = g_active_buffer orelse return;
+
+    const show_nu = getLuaOptionBool("number", true);
+    const rel_nu = getLuaOptionBool("relativenumber", false);
+    macos.macos_window_set_line_numbers(win, show_nu, rel_nu);
 
     const mode_int: c_int = switch (g_editor.mode) {
         .normal => 0,
@@ -325,6 +352,7 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
     g_editor.handle_key(buf, ev) catch {};
 
     if (was_colon_cmd and ev.code == .enter and g_lua != null) {
+        root.lua.set_internal_cursor(g_editor.cursor.line, g_editor.cursor.col);
         const L = g_lua.?;
         _ = c.lua_getglobal(L, "editor");
         _ = c.lua_getfield(L, -1, "dispatch_command");
@@ -333,6 +361,13 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
             c.lua_pop(L, 2);
         } else {
             c.lua_pop(L, 2);
+        }
+
+        const cur_info = root.lua.get_internal_cursor();
+        if (cur_info.updated) {
+            g_editor.cursor.line = cur_info.line;
+            g_editor.cursor.col = cur_info.col;
+            g_editor.cursor.desired_col = cur_info.col;
         }
 
         if (root.lua.is_quit_requested()) {

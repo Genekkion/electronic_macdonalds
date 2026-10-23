@@ -36,6 +36,7 @@ pub const EditorState = struct {
     cursor: Cursor = .{},
     anchor: ?Cursor = null,
     pending_cmd: ?u8 = null,
+    count: ?usize = null,
     cmd_line: [256]u8 = [_]u8{0} ** 256,
     cmd_len: usize = 0,
     cmd_cursor: usize = 0,
@@ -314,83 +315,119 @@ pub const EditorState = struct {
         }
     }
 
+    pub fn goto_line(self: *EditorState, buf: *const Buffer, line_1based: ?usize) void {
+        const total = buf.line_count();
+        if (total == 0) {
+            self.cursor.line = 0;
+            self.cursor.col = 0;
+            self.cursor.desired_col = 0;
+            return;
+        }
+        const target_line = if (line_1based) |num|
+            @min(if (num > 0) num - 1 else 0, total - 1)
+        else
+            total - 1;
+
+        self.cursor.line = target_line;
+        const len = get_line_len(buf, self.cursor.line);
+        const max_col = if (len > 0) len - 1 else 0;
+        self.cursor.col = @min(self.cursor.desired_col, max_col);
+    }
+
     fn handle_visual_key(self: *EditorState, buf: *Buffer, ev: KeyEvent) !void {
         switch (ev.code) {
             .escape => {
                 self.mode = .normal;
                 self.anchor = null;
+                self.pending_cmd = null;
             },
             .character => {
-                if (ev.char) |ch| switch (ch) {
-                    'y' => try self.yank_selection(buf),
-                    'd', 'x' => try self.delete_selection(buf),
-                    'h', 'l', 'j', 'k', '0', '$', 'w', 'b' => self.handle_motion_key(buf, ch),
-                    else => {},
-                };
+                if (ev.char) |ch| {
+                    if (self.pending_cmd) |pending| {
+                        self.pending_cmd = null;
+                        if (pending == 'g' and ch == 'g') {
+                            self.goto_line(buf, 1);
+                            return;
+                        }
+                    }
+                    switch (ch) {
+                        'g' => {
+                            self.pending_cmd = 'g';
+                        },
+                        'G' => self.goto_line(buf, null),
+                        'y' => try self.yank_selection(buf),
+                        'd', 'x' => try self.delete_selection(buf),
+                        'h', 'l', 'j', 'k', '0', '$', 'w', 'b' => self.handle_motion_key(buf, ch, 1),
+                        else => {},
+                    }
+                }
             },
-            .left, .right, .down, .up => self.handle_arrow_key(buf, ev.code),
+            .left, .right, .down, .up => self.handle_arrow_key(buf, ev.code, 1),
             else => {},
         }
     }
 
-    fn handle_motion_key(self: *EditorState, buf: *const Buffer, char: u8) void {
-        switch (char) {
-            'h' => {
-                if (self.cursor.col > 0) {
-                    self.cursor.col -= 1;
-                    self.cursor.desired_col = self.cursor.col;
-                }
-            },
-            'l' => {
-                const len = get_line_len(buf, self.cursor.line);
-                const max_col = if (len > 0) len - 1 else 0;
-                if (self.cursor.col < max_col) {
-                    self.cursor.col += 1;
-                    self.cursor.desired_col = self.cursor.col;
-                }
-            },
-            'j' => {
-                if (self.cursor.line + 1 < buf.line_count()) {
-                    self.cursor.line += 1;
+    fn handle_motion_key(self: *EditorState, buf: *const Buffer, char: u8, count: usize) void {
+        var step: usize = 0;
+        while (step < count) : (step += 1) {
+            switch (char) {
+                'h' => {
+                    if (self.cursor.col > 0) {
+                        self.cursor.col -= 1;
+                        self.cursor.desired_col = self.cursor.col;
+                    }
+                },
+                'l' => {
                     const len = get_line_len(buf, self.cursor.line);
                     const max_col = if (len > 0) len - 1 else 0;
-                    self.cursor.col = @min(self.cursor.desired_col, max_col);
-                }
-            },
-            'k' => {
-                if (self.cursor.line > 0) {
-                    self.cursor.line -= 1;
+                    if (self.cursor.col < max_col) {
+                        self.cursor.col += 1;
+                        self.cursor.desired_col = self.cursor.col;
+                    }
+                },
+                'j' => {
+                    if (self.cursor.line + 1 < buf.line_count()) {
+                        self.cursor.line += 1;
+                        const len = get_line_len(buf, self.cursor.line);
+                        const max_col = if (len > 0) len - 1 else 0;
+                        self.cursor.col = @min(self.cursor.desired_col, max_col);
+                    }
+                },
+                'k' => {
+                    if (self.cursor.line > 0) {
+                        self.cursor.line -= 1;
+                        const len = get_line_len(buf, self.cursor.line);
+                        const max_col = if (len > 0) len - 1 else 0;
+                        self.cursor.col = @min(self.cursor.desired_col, max_col);
+                    }
+                },
+                '0' => {
+                    self.cursor.col = 0;
+                    self.cursor.desired_col = 0;
+                },
+                '$' => {
                     const len = get_line_len(buf, self.cursor.line);
                     const max_col = if (len > 0) len - 1 else 0;
-                    self.cursor.col = @min(self.cursor.desired_col, max_col);
-                }
-            },
-            '0' => {
-                self.cursor.col = 0;
-                self.cursor.desired_col = 0;
-            },
-            '$' => {
-                const len = get_line_len(buf, self.cursor.line);
-                const max_col = if (len > 0) len - 1 else 0;
-                self.cursor.col = max_col;
-                self.cursor.desired_col = max_col;
-            },
-            'w' => {
-                self.move_word_forward(buf);
-            },
-            'b' => {
-                self.move_word_backward(buf);
-            },
-            else => {},
+                    self.cursor.col = max_col;
+                    self.cursor.desired_col = max_col;
+                },
+                'w' => {
+                    self.move_word_forward(buf);
+                },
+                'b' => {
+                    self.move_word_backward(buf);
+                },
+                else => {},
+            }
         }
     }
 
-    fn handle_arrow_key(self: *EditorState, buf: *const Buffer, code: KeyCode) void {
+    fn handle_arrow_key(self: *EditorState, buf: *const Buffer, code: KeyCode, count: usize) void {
         switch (code) {
-            .left => self.handle_motion_key(buf, 'h'),
-            .right => self.handle_motion_key(buf, 'l'),
-            .down => self.handle_motion_key(buf, 'j'),
-            .up => self.handle_motion_key(buf, 'k'),
+            .left => self.handle_motion_key(buf, 'h', count),
+            .right => self.handle_motion_key(buf, 'l', count),
+            .down => self.handle_motion_key(buf, 'j', count),
+            .up => self.handle_motion_key(buf, 'k', count),
             else => {},
         }
     }
@@ -535,153 +572,199 @@ pub const EditorState = struct {
     fn handle_normal_key(self: *EditorState, buf: *Buffer, ev: KeyEvent) !void {
         if (self.pending_cmd) |pending| {
             self.pending_cmd = null;
-            if (pending == 'd' and ev.code == .character and ev.char == 'd') {
-                try self.delete_current_line(buf);
+            if (ev.code == .character) {
+                if (ev.char) |ch| {
+                    if (pending == 'd' and ch == 'd') {
+                        try self.delete_current_line(buf);
+                        self.count = null;
+                        return;
+                    } else if (pending == 'g' and ch == 'g') {
+                        const target = self.count orelse 1;
+                        self.goto_line(buf, target);
+                        self.count = null;
+                        return;
+                    }
+                }
             }
+            self.count = null;
             return;
         }
 
         switch (ev.code) {
             .character => {
-                if (ev.char) |char| switch (char) {
-                    'i' => {
-                        buf.begin_undo_group(self.cursor.line, self.cursor.col);
-                        self.mode = .insert;
-                    },
-                    'a' => {
-                        const len = get_line_len(buf, self.cursor.line);
-                        if (self.cursor.col < len) {
-                            self.cursor.col += 1;
-                        }
-                        self.cursor.desired_col = self.cursor.col;
-                        buf.begin_undo_group(self.cursor.line, self.cursor.col);
-                        self.mode = .insert;
-                    },
-                    'o' => {
-                        buf.begin_undo_group(self.cursor.line, self.cursor.col);
-                        if (self.cursor.line + 1 < buf.line_count()) {
-                            const next_start = buf.lines.get_line_start(self.cursor.line + 1).?;
-                            const insert_pos = if (next_start > 0) next_start - 1 else 0;
-                            try buf.insert(insert_pos, "\n");
-                        } else {
-                            try buf.insert(buf.len(), "\n");
-                        }
-                        self.cursor.line += 1;
-                        self.cursor.col = 0;
-                        self.cursor.desired_col = 0;
-                        self.mode = .insert;
-                    },
-                    'v' => {
-                        self.mode = .visual;
-                        self.anchor = self.cursor;
-                    },
-                    'V' => {
-                        self.mode = .visual_line;
-                        self.anchor = self.cursor;
-                    },
-                    'p' => {
-                        if (clipboard.get()) |clip_text| {
-                            if (clip_text.len > 0) {
-                                const copy_len = @min(clip_text.len, self.register.len);
-                                @memcpy(self.register[0..copy_len], clip_text[0..copy_len]);
-                                self.register_len = copy_len;
-                                self.register_is_line = (clip_text[clip_text.len - 1] == '\n');
+                if (ev.char) |char| {
+                    if ((char >= '1' and char <= '9') or (char == '0' and self.count != null)) {
+                        self.count = (self.count orelse 0) * 10 + (char - '0');
+                        return;
+                    }
+
+                    const count = self.count orelse 1;
+                    var consumed_count = true;
+
+                    switch (char) {
+                        'g' => {
+                            self.pending_cmd = 'g';
+                            consumed_count = false;
+                        },
+                        'G' => {
+                            self.goto_line(buf, self.count);
+                        },
+                        'i' => {
+                            buf.begin_undo_group(self.cursor.line, self.cursor.col);
+                            self.mode = .insert;
+                        },
+                        'a' => {
+                            const len = get_line_len(buf, self.cursor.line);
+                            if (self.cursor.col < len) {
+                                self.cursor.col += 1;
                             }
-                        }
-                        if (self.register_len > 0) {
-                            if (self.register_is_line) {
-                                if (self.cursor.line + 1 < buf.line_count()) {
-                                    const next_start = buf.lines.get_line_start(self.cursor.line + 1).?;
-                                    try buf.insert(next_start, self.get_register());
-                                } else {
-                                    try buf.insert(buf.len(), "\n");
-                                    try buf.insert(buf.len(), self.get_register());
-                                }
-                                self.cursor.line += 1;
-                                self.cursor.col = 0;
-                                self.cursor.desired_col = 0;
+                            self.cursor.desired_col = self.cursor.col;
+                            buf.begin_undo_group(self.cursor.line, self.cursor.col);
+                            self.mode = .insert;
+                        },
+                        'o' => {
+                            buf.begin_undo_group(self.cursor.line, self.cursor.col);
+                            if (self.cursor.line + 1 < buf.line_count()) {
+                                const next_start = buf.lines.get_line_start(self.cursor.line + 1).?;
+                                const insert_pos = if (next_start > 0) next_start - 1 else 0;
+                                try buf.insert(insert_pos, "\n");
                             } else {
-                                const line_start = buf.lines.get_line_start(self.cursor.line) orelse 0;
-                                const line_len = get_line_len(buf, self.cursor.line);
-                                const insert_pos = if (line_len > 0) line_start + @min(self.cursor.col + 1, line_len) else line_start;
-                                try buf.insert(insert_pos, self.get_register());
-                                self.cursor.col = @min(self.cursor.col + self.register_len, get_line_len(buf, self.cursor.line));
+                                try buf.insert(buf.len(), "\n");
+                            }
+                            self.cursor.line += 1;
+                            self.cursor.col = 0;
+                            self.cursor.desired_col = 0;
+                            self.mode = .insert;
+                        },
+                        'v' => {
+                            self.mode = .visual;
+                            self.anchor = self.cursor;
+                        },
+                        'V' => {
+                            self.mode = .visual_line;
+                            self.anchor = self.cursor;
+                        },
+                        'p' => {
+                            if (clipboard.get()) |clip_text| {
+                                if (clip_text.len > 0) {
+                                    const copy_len = @min(clip_text.len, self.register.len);
+                                    @memcpy(self.register[0..copy_len], clip_text[0..copy_len]);
+                                    self.register_len = copy_len;
+                                    self.register_is_line = (clip_text[clip_text.len - 1] == '\n');
+                                }
+                            }
+                            if (self.register_len > 0) {
+                                if (self.register_is_line) {
+                                    if (self.cursor.line + 1 < buf.line_count()) {
+                                        const next_start = buf.lines.get_line_start(self.cursor.line + 1).?;
+                                        try buf.insert(next_start, self.get_register());
+                                    } else {
+                                        try buf.insert(buf.len(), "\n");
+                                        try buf.insert(buf.len(), self.get_register());
+                                    }
+                                    self.cursor.line += 1;
+                                    self.cursor.col = 0;
+                                    self.cursor.desired_col = 0;
+                                } else {
+                                    const line_start = buf.lines.get_line_start(self.cursor.line) orelse 0;
+                                    const line_len = get_line_len(buf, self.cursor.line);
+                                    const insert_pos = if (line_len > 0) line_start + @min(self.cursor.col + 1, line_len) else line_start;
+                                    try buf.insert(insert_pos, self.get_register());
+                                    self.cursor.col = @min(self.cursor.col + self.register_len, get_line_len(buf, self.cursor.line));
+                                    self.cursor.desired_col = self.cursor.col;
+                                }
+                            }
+                        },
+                        'h', 'l', 'j', 'k', '0', '$', 'w', 'b' => self.handle_motion_key(buf, char, count),
+                        'x' => {
+                            var step: usize = 0;
+                            while (step < count) : (step += 1) {
+                                const cur_len = get_line_len(buf, self.cursor.line);
+                                if (cur_len > 0 and self.cursor.col < cur_len) {
+                                    const line_start = buf.lines.get_line_start(self.cursor.line) orelse 0;
+                                    try buf.delete(line_start + self.cursor.col, 1);
+                                    const new_len = cur_len - 1;
+                                    if (new_len > 0 and self.cursor.col >= new_len) {
+                                        self.cursor.col = new_len - 1;
+                                    }
+                                    self.cursor.desired_col = self.cursor.col;
+                                }
+                            }
+                        },
+                        'd' => {
+                            self.pending_cmd = 'd';
+                            consumed_count = false;
+                        },
+                        'u' => {
+                            if (buf.undo()) |step| {
+                                self.cursor.line = step.cursor_line;
+                                self.cursor.col = step.cursor_col;
                                 self.cursor.desired_col = self.cursor.col;
                             }
-                        }
-                    },
-                    'h', 'l', 'j', 'k', '0', '$', 'w', 'b' => self.handle_motion_key(buf, char),
-                    'x' => {
-                        const cur_len = get_line_len(buf, self.cursor.line);
-                        if (cur_len > 0 and self.cursor.col < cur_len) {
-                            const line_start = buf.lines.get_line_start(self.cursor.line) orelse 0;
-                            try buf.delete(line_start + self.cursor.col, 1);
-                            const new_len = cur_len - 1;
-                            if (new_len > 0 and self.cursor.col >= new_len) {
-                                self.cursor.col = new_len - 1;
+                        },
+                        18 => { // Ctrl-R
+                            if (buf.redo()) |step| {
+                                self.cursor.line = step.cursor_line;
+                                self.cursor.col = step.cursor_col;
+                                self.cursor.desired_col = self.cursor.col;
                             }
-                            self.cursor.desired_col = self.cursor.col;
-                        }
-                    },
-                    'd' => {
-                        self.pending_cmd = 'd';
-                    },
-                    'u' => {
-                        if (buf.undo()) |step| {
-                            self.cursor.line = step.cursor_line;
-                            self.cursor.col = step.cursor_col;
-                            self.cursor.desired_col = self.cursor.col;
-                        }
-                    },
-                    18 => { // Ctrl-R
-                        if (buf.redo()) |step| {
-                            self.cursor.line = step.cursor_line;
-                            self.cursor.col = step.cursor_col;
-                            self.cursor.desired_col = self.cursor.col;
-                        }
-                    },
-                    ':' => {
-                        self.mode = .command_line;
-                        self.cmd_prefix = ':';
-                        self.cmd_len = 0;
-                        self.cmd_cursor = 0;
-                    },
-                    '/' => {
-                        self.mode = .command_line;
-                        self.cmd_prefix = '/';
-                        self.cmd_len = 0;
-                        self.cmd_cursor = 0;
-                        self.search_dir = .forward;
-                        self.search_origin = self.cursor;
-                    },
-                    '?' => {
-                        self.mode = .command_line;
-                        self.cmd_prefix = '?';
-                        self.cmd_len = 0;
-                        self.cmd_cursor = 0;
-                        self.search_dir = .backward;
-                        self.search_origin = self.cursor;
-                    },
-                    'n' => {
-                        _ = self.jump_to_match(buf, self.search_dir, true);
-                    },
-                    'N' => {
-                        const rev: search_mod.Direction = if (self.search_dir == .forward) .backward else .forward;
-                        _ = self.jump_to_match(buf, rev, true);
-                    },
-                    '*' => {
-                        self.search_word_under_cursor(buf, .forward);
-                    },
-                    '#' => {
-                        self.search_word_under_cursor(buf, .backward);
-                    },
-                    else => {},
-                };
+                        },
+                        ':' => {
+                            self.mode = .command_line;
+                            self.cmd_prefix = ':';
+                            self.cmd_len = 0;
+                            self.cmd_cursor = 0;
+                        },
+                        '/' => {
+                            self.mode = .command_line;
+                            self.cmd_prefix = '/';
+                            self.cmd_len = 0;
+                            self.cmd_cursor = 0;
+                            self.search_dir = .forward;
+                            self.search_origin = self.cursor;
+                        },
+                        '?' => {
+                            self.mode = .command_line;
+                            self.cmd_prefix = '?';
+                            self.cmd_len = 0;
+                            self.cmd_cursor = 0;
+                            self.search_dir = .backward;
+                            self.search_origin = self.cursor;
+                        },
+                        'n' => {
+                            var step: usize = 0;
+                            while (step < count) : (step += 1) {
+                                _ = self.jump_to_match(buf, self.search_dir, true);
+                            }
+                        },
+                        'N' => {
+                            const rev: search_mod.Direction = if (self.search_dir == .forward) .backward else .forward;
+                            var step: usize = 0;
+                            while (step < count) : (step += 1) {
+                                _ = self.jump_to_match(buf, rev, true);
+                            }
+                        },
+                        '*' => {
+                            self.search_word_under_cursor(buf, .forward);
+                        },
+                        '#' => {
+                            self.search_word_under_cursor(buf, .backward);
+                        },
+                        else => {},
+                    }
+                    if (consumed_count) self.count = null;
+                }
             },
             .escape => {
                 self.hlsearch = false;
+                self.pending_cmd = null;
+                self.count = null;
             },
-            .left, .right, .down, .up => self.handle_arrow_key(buf, ev.code),
+            .left, .right, .down, .up => {
+                const count = self.count orelse 1;
+                self.handle_arrow_key(buf, ev.code, count);
+                self.count = null;
+            },
             else => {},
         }
     }
@@ -1360,4 +1443,58 @@ test "test_vim_command_line_cursor_navigation_and_editing" {
     // End moves to end
     try state.handle_key(&buf, .{ .code = .end });
     try testing.expectEqual(@as(usize, 1), state.cmd_cursor);
+}
+
+test "test_vim_motion_G_and_gg_basic" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "line 1\nline 2\nline 3\nline 4\nline 5\n");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 0 } };
+
+    // 'G' jumps to last line
+    try state.handle_key(&buf, .{ .code = .character, .char = 'G' });
+    try testing.expectEqual(@as(usize, 5), state.cursor.line);
+
+    // 'gg' jumps to first line
+    try state.handle_key(&buf, .{ .code = .character, .char = 'g' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'g' });
+    try testing.expectEqual(@as(usize, 0), state.cursor.line);
+}
+
+test "test_vim_motion_count_prefix_G_and_gg" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 0 } };
+
+    // '7G' jumps to line 7 (index 6)
+    try state.handle_key(&buf, .{ .code = .character, .char = '7' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'G' });
+    try testing.expectEqual(@as(usize, 6), state.cursor.line);
+
+    // '3gg' jumps to line 3 (index 2)
+    try state.handle_key(&buf, .{ .code = .character, .char = '3' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'g' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'g' });
+    try testing.expectEqual(@as(usize, 2), state.cursor.line);
+}
+
+test "test_vim_motion_count_prefix_j_and_k" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 0 } };
+
+    // '4j' moves down 4 lines
+    try state.handle_key(&buf, .{ .code = .character, .char = '4' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'j' });
+    try testing.expectEqual(@as(usize, 4), state.cursor.line);
+
+    // '2k' moves up 2 lines
+    try state.handle_key(&buf, .{ .code = .character, .char = '2' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'k' });
+    try testing.expectEqual(@as(usize, 2), state.cursor.line);
 }

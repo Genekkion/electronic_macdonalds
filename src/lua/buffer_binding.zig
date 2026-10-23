@@ -84,6 +84,8 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
         .{ .name = "set_current_buffer", .func = lua_set_current_buffer },
         .{ .name = "list_buffers", .func = lua_list_buffers },
         .{ .name = "get_buffer_by_id", .func = lua_get_buffer_by_id },
+        .{ .name = "get_cursor", .func = lua_get_cursor },
+        .{ .name = "set_cursor", .func = lua_set_cursor },
         .{ .name = "bind_key", .func = lua_bind_key },
         .{ .name = "dispatch_key_combo", .func = lua_dispatch_key_combo },
         .{ .name = null, .func = null },
@@ -391,6 +393,42 @@ fn lua_set_current_buffer(L: ?*c.lua_State) callconv(.c) c_int {
 
 fn lua_is_quit_requested(L: ?*c.lua_State) callconv(.c) c_int {
     return result.push_success_bool(L, g_quit_requested);
+}
+
+var g_cursor_line: usize = 0;
+var g_cursor_col: usize = 0;
+var g_cursor_updated: bool = false;
+
+pub fn set_internal_cursor(line: usize, col: usize) void {
+    g_cursor_line = line;
+    g_cursor_col = col;
+    g_cursor_updated = false;
+}
+
+pub fn get_internal_cursor() struct { line: usize, col: usize, updated: bool } {
+    return .{
+        .line = g_cursor_line,
+        .col = g_cursor_col,
+        .updated = g_cursor_updated,
+    };
+}
+
+fn lua_get_cursor(L: ?*c.lua_State) callconv(.c) c_int {
+    c.lua_pushinteger(L, @intCast(g_cursor_line));
+    c.lua_pushinteger(L, @intCast(g_cursor_col));
+    return 2;
+}
+
+fn lua_set_cursor(L: ?*c.lua_State) callconv(.c) c_int {
+    if (c.lua_type(L, 1) != c.LUA_TNUMBER or c.lua_type(L, 2) != c.LUA_TNUMBER) {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected line and col numbers");
+    }
+    const line = c.lua_tointegerx(L, 1, null);
+    const col = c.lua_tointegerx(L, 2, null);
+    g_cursor_line = @intCast(@max(0, line));
+    g_cursor_col = @intCast(@max(0, col));
+    g_cursor_updated = true;
+    return result.push_success_bool(L, true);
 }
 
 fn lua_close_buffer(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1255,6 +1293,39 @@ test "test_lua_substitute_commands" {
         \\assert(u_ok == true)
         \\local s3, _, _ = buf:get_slice(0, buf:len())
         \\assert(s3 == "OMEGA beta alpha gamma")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_vim_goto_line_colon_command" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\editor.set_current_buffer(buf)
+        \\buf:insert(0, "line 1\nline 2\nline 3\nline 4\nline 5\n")
+        \\
+        \\editor.dispatch_command(":3")
+        \\local l, c = editor.get_cursor()
+        \\assert(l == 2)
+        \\assert(c == 0)
+        \\
+        \\editor.dispatch_command(":$")
+        \\local last_l, _ = editor.get_cursor()
+        \\assert(last_l == 5)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_line_number_options" {
+    const script =
+        \\assert(editor.get_option("number") == true)
+        \\assert(editor.get_option("relativenumber") == false)
+        \\
+        \\editor.dispatch_command(":set rnu")
+        \\assert(editor.get_option("relativenumber") == true)
+        \\
+        \\editor.dispatch_command(":set nornu nonu")
+        \\assert(editor.get_option("relativenumber") == false)
+        \\assert(editor.get_option("number") == false)
     ;
     try run_lua_test(script);
 }

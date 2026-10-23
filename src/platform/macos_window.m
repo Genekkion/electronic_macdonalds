@@ -38,6 +38,8 @@
 @property (nonatomic, copy) NSString *statusText;
 @property (nonatomic, assign) BOOL hasSelection;
 @property (nonatomic, assign) BOOL isLineSelection;
+@property (nonatomic, assign) BOOL showLineNumbers;
+@property (nonatomic, assign) BOOL relativeLineNumbers;
 @property (nonatomic, assign) int selStartLine;
 @property (nonatomic, assign) int selStartCol;
 @property (nonatomic, assign) int selEndLine;
@@ -61,6 +63,8 @@
         _cursorCol = 0;
         _mode = 0;
         _cmdCursorCol = -1;
+        _showLineNumbers = YES;
+        _relativeLineNumbers = NO;
         _statusText = @"";
         _cursorVisible = YES;
 
@@ -152,6 +156,51 @@
     int visibleRows = (int)floor((statusY) / _lineHeight);
     int maxLine = totalLines < visibleRows ? totalLines : visibleRows;
 
+    CGFloat gutterWidth = 0.0;
+    CGFloat textStartX = 10.0;
+    int digits = 1;
+
+    if (_showLineNumbers) {
+        int temp = totalLines;
+        while (temp >= 10) { digits++; temp /= 10; }
+        if (digits < 3) digits = 3;
+        gutterWidth = (digits + 2) * _charWidth;
+        textStartX = gutterWidth + 8.0;
+
+        // 1.5 Draw gutter background column
+        CGContextSetRGBFillColor(context, 0.13, 0.14, 0.16, 1.0);
+        CGContextFillRect(context, NSMakeRect(0, 0, gutterWidth, statusY));
+
+        // Draw gutter separator vertical line
+        CGContextSetRGBStrokeColor(context, 0.22, 0.24, 0.28, 1.0);
+        CGContextSetLineWidth(context, 1.0);
+        CGPoint gutterPoints[2] = { CGPointMake(gutterWidth, 0), CGPointMake(gutterWidth, statusY) };
+        CGContextStrokeLineSegments(context, gutterPoints, 2);
+
+        // Draw line numbers
+        NSColor *normalNumColor = [NSColor colorWithCalibratedRed:0.38 green:0.42 blue:0.48 alpha:1.0];
+        NSColor *activeNumColor = [NSColor colorWithCalibratedRed:0.90 green:0.75 blue:0.35 alpha:1.0];
+        NSDictionary *normalNumAttrs = @{
+            NSFontAttributeName: (__bridge id)_font,
+            NSForegroundColorAttributeName: normalNumColor
+        };
+        NSDictionary *activeNumAttrs = @{
+            NSFontAttributeName: (__bridge id)_font,
+            NSForegroundColorAttributeName: activeNumColor
+        };
+
+        for (int i = 0; i < maxLine; i++) {
+            int lineNum = i + 1;
+            BOOL isActive = (i == _cursorLine);
+            if (_relativeLineNumbers && !isActive) {
+                lineNum = abs(i - _cursorLine);
+            }
+            NSString *numStr = [NSString stringWithFormat:@"%*d", digits, lineNum];
+            NSAttributedString *attrNum = [[NSAttributedString alloc] initWithString:numStr attributes:(isActive ? activeNumAttrs : normalNumAttrs)];
+            [attrNum drawAtPoint:NSMakePoint(gutterWidth - (digits + 1) * _charWidth, i * _lineHeight)];
+        }
+    }
+
     // Attributes for text rendering
     NSColor *textColor = [NSColor colorWithCalibratedRed:0.88 green:0.88 blue:0.88 alpha:1.0];
     NSDictionary *attributes = @{
@@ -167,20 +216,20 @@
         for (int i = startL; i <= endL && i < maxLine; i++) {
             NSRect selRect;
             if (_isLineSelection) {
-                selRect = NSMakeRect(0, i * _lineHeight, self.bounds.size.width, _lineHeight);
+                selRect = NSMakeRect(textStartX, i * _lineHeight, self.bounds.size.width - textStartX, _lineHeight);
             } else if (startL == endL) {
-                CGFloat startX = 10.0 + _selStartCol * _charWidth;
+                CGFloat startX = textStartX + _selStartCol * _charWidth;
                 CGFloat width = (_selEndCol - _selStartCol + 1) * _charWidth;
                 selRect = NSMakeRect(startX, i * _lineHeight, width, _lineHeight);
             } else if (i == startL) {
-                CGFloat startX = 10.0 + _selStartCol * _charWidth;
+                CGFloat startX = textStartX + _selStartCol * _charWidth;
                 CGFloat width = self.bounds.size.width - startX;
                 selRect = NSMakeRect(startX, i * _lineHeight, width, _lineHeight);
             } else if (i == endL) {
-                CGFloat width = 10.0 + (_selEndCol + 1) * _charWidth;
-                selRect = NSMakeRect(0, i * _lineHeight, width, _lineHeight);
+                CGFloat width = (_selEndCol + 1) * _charWidth;
+                selRect = NSMakeRect(textStartX, i * _lineHeight, width, _lineHeight);
             } else {
-                selRect = NSMakeRect(0, i * _lineHeight, self.bounds.size.width, _lineHeight);
+                selRect = NSMakeRect(textStartX, i * _lineHeight, self.bounds.size.width - textStartX, _lineHeight);
             }
             CGContextFillRect(context, selRect);
         }
@@ -194,7 +243,7 @@
             int col = _searchHighlights[i * 3 + 1];
             int len = _searchHighlights[i * 3 + 2];
             if (line < maxLine) {
-                CGFloat x = 10.0 + col * _charWidth;
+                CGFloat x = textStartX + col * _charWidth;
                 CGFloat y = line * _lineHeight;
                 CGFloat w = len * _charWidth;
                 CGContextFillRect(context, NSMakeRect(x, y, w, _lineHeight));
@@ -210,14 +259,14 @@
             NSString *str = [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
             if (str) {
                 NSAttributedString *attrStr = [[NSAttributedString alloc] initWithString:str attributes:attributes];
-                [attrStr drawAtPoint:NSMakePoint(10.0, i * _lineHeight)];
+                [attrStr drawAtPoint:NSMakePoint(textStartX, i * _lineHeight)];
             }
         }
     }
 
     // 3. Draw buffer cursor (block for Normal, bar for Insert, subtle preview block for Command-line)
     if (_cursorVisible) {
-        CGFloat cursorX = 10.0 + _cursorCol * _charWidth;
+        CGFloat cursorX = textStartX + _cursorCol * _charWidth;
         CGFloat cursorY = _cursorLine * _lineHeight;
         CGFloat cursorW = (_mode == 1) ? 2.0 : _charWidth;
         NSRect cursorRect = NSMakeRect(cursorX, cursorY, cursorW, _lineHeight);
@@ -368,6 +417,18 @@ void macos_window_set_command_cursor(void *win, int col) {
         if ([[window contentView] isKindOfClass:[EditorView class]]) {
             EditorView *view = (EditorView *)[window contentView];
             view.cmdCursorCol = col;
+            [view setNeedsDisplay:YES];
+        }
+    }
+}
+
+void macos_window_set_line_numbers(void *win, bool show, bool relative) {
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win;
+        if ([[window contentView] isKindOfClass:[EditorView class]]) {
+            EditorView *view = (EditorView *)[window contentView];
+            view.showLineNumbers = show;
+            view.relativeLineNumbers = relative;
             [view setNeedsDisplay:YES];
         }
     }

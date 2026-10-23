@@ -5,6 +5,19 @@ local M = {}
 
 editor.commands = editor.commands or {}
 
+editor.options = editor.options or {
+    number = true,
+    relativenumber = false,
+}
+
+function editor.set_option(opt, val)
+    editor.options[opt] = val
+end
+
+function editor.get_option(opt)
+    return editor.options[opt]
+end
+
 --- Register a command with a given name and callback function
 function editor.create_command(name, fn)
     assert(type(name) == "string", "command name must be a string")
@@ -22,6 +35,28 @@ function editor.dispatch_command(line)
     local raw = line:match("^:?%s*(.-)%s*$")
     if raw == "" then
         return true
+    end
+
+    -- Check for numeric line jump: e.g. ":42", "42", ":$"
+    local num = raw:match("^(%d+)$")
+    if num then
+        local target = tonumber(num)
+        local cur_buf = editor.get_current_buffer()
+        if cur_buf then
+            local count = cur_buf:line_count()
+            local line_idx = math.max(0, math.min(target - 1, count - 1))
+            editor.set_cursor(line_idx, 0)
+            return true
+        end
+    end
+    if raw == "$" then
+        local cur_buf = editor.get_current_buffer()
+        if cur_buf then
+            local count = cur_buf:line_count()
+            local line_idx = math.max(0, count - 1)
+            editor.set_cursor(line_idx, 0)
+            return true
+        end
     end
 
     -- Extract command name (including optional !) and remainder arguments
@@ -215,6 +250,22 @@ editor.create_command("s", function(args)
         editor.set_status(tostring(count) .. " substitution(s)")
     else
         editor.set_error("Substitution failed: " .. tostring(msg))
+    end
+end)
+
+-- :set <options...> - Set options
+editor.create_command("set", function(args)
+    if not args or args == "" then return end
+    for item in args:gmatch("%S+") do
+        if item == "nu" or item == "number" then
+            editor.set_option("number", true)
+        elseif item == "nonu" or item == "nonumber" then
+            editor.set_option("number", false)
+        elseif item == "rnu" or item == "relativenumber" then
+            editor.set_option("relativenumber", true)
+        elseif item == "nornu" or item == "norelativenumber" then
+            editor.set_option("relativenumber", false)
+        end
     end
 end)
 
