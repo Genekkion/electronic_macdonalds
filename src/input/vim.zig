@@ -48,6 +48,7 @@ pub const EditorState = struct {
     search_len: usize = 0,
     search_dir: search_mod.Direction = .forward,
     hlsearch: bool = false,
+    search_origin: Cursor = .{},
 
     pub fn get_search_pattern(self: *const EditorState) []const u8 {
         return self.search_pattern[0..self.search_len];
@@ -396,13 +397,34 @@ pub const EditorState = struct {
     fn handle_command_line_key(self: *EditorState, buf: *Buffer, ev: KeyEvent) void {
         switch (ev.code) {
             .escape => {
+                if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                    self.cursor = self.search_origin;
+                    self.hlsearch = false;
+                }
                 self.mode = .normal;
                 self.cmd_len = 0;
             },
             .backspace => {
                 if (self.cmd_len > 0) {
                     self.cmd_len -= 1;
+                    if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                        if (self.cmd_len > 0) {
+                            @memcpy(self.search_pattern[0..self.cmd_len], self.cmd_line[0..self.cmd_len]);
+                            self.search_len = self.cmd_len;
+                            self.hlsearch = true;
+                            self.cursor = self.search_origin;
+                            _ = self.jump_to_match(buf, self.search_dir, false);
+                        } else {
+                            self.search_len = 0;
+                            self.hlsearch = false;
+                            self.cursor = self.search_origin;
+                        }
+                    }
                 } else {
+                    if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                        self.cursor = self.search_origin;
+                        self.hlsearch = false;
+                    }
                     self.mode = .normal;
                 }
             },
@@ -417,9 +439,8 @@ pub const EditorState = struct {
                     if (self.cmd_len > 0) {
                         @memcpy(self.search_pattern[0..self.cmd_len], self.cmd_line[0..self.cmd_len]);
                         self.search_len = self.cmd_len;
+                        self.hlsearch = true;
                     }
-                    self.search_dir = if (self.cmd_prefix == '/') .forward else .backward;
-                    self.hlsearch = true;
                     self.cmd_len = 0;
                     self.mode = .normal;
                     _ = self.jump_to_match(buf, self.search_dir, false);
@@ -430,6 +451,13 @@ pub const EditorState = struct {
                     if (self.cmd_len < self.cmd_line.len) {
                         self.cmd_line[self.cmd_len] = ch;
                         self.cmd_len += 1;
+                        if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                            @memcpy(self.search_pattern[0..self.cmd_len], self.cmd_line[0..self.cmd_len]);
+                            self.search_len = self.cmd_len;
+                            self.hlsearch = true;
+                            self.cursor = self.search_origin;
+                            _ = self.jump_to_match(buf, self.search_dir, false);
+                        }
                     }
                 }
             },
@@ -554,11 +582,15 @@ pub const EditorState = struct {
                         self.mode = .command_line;
                         self.cmd_prefix = '/';
                         self.cmd_len = 0;
+                        self.search_dir = .forward;
+                        self.search_origin = self.cursor;
                     },
                     '?' => {
                         self.mode = .command_line;
                         self.cmd_prefix = '?';
                         self.cmd_len = 0;
+                        self.search_dir = .backward;
+                        self.search_origin = self.cursor;
                     },
                     'n' => {
                         _ = self.jump_to_match(buf, self.search_dir, true);
@@ -1169,4 +1201,49 @@ test "test_vim_smartcase_navigation" {
     }
     try state.handle_key(&buf, .{ .code = .enter });
     try testing.expectEqual(@as(usize, 20), state.cursor.col);
+}
+
+test "test_vim_incremental_search_live_preview" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "first test final test");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 0 } };
+
+    // Enter search mode '/'
+    try state.handle_key(&buf, .{ .code = .character, .char = '/' });
+    try testing.expectEqual(@as(usize, 0), state.cursor.col);
+
+    // Type 't': first 't' ahead of col 0 is at offset 4 ("first")
+    try state.handle_key(&buf, .{ .code = .character, .char = 't' });
+    try testing.expectEqual(@as(usize, 4), state.cursor.col);
+    try testing.expect(state.hlsearch == true);
+    try testing.expectEqualStrings("t", state.get_search_pattern());
+
+    // Type 'e': "te" matches at col 6 ("test")
+    try state.handle_key(&buf, .{ .code = .character, .char = 'e' });
+    try testing.expectEqual(@as(usize, 6), state.cursor.col);
+    try testing.expectEqualStrings("te", state.get_search_pattern());
+}
+
+test "test_vim_incremental_search_escape_cancels" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "start ... middle ... end");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 2 } };
+
+    // Start search and type "end"
+    try state.handle_key(&buf, .{ .code = .character, .char = '/' });
+    for ("end") |ch| {
+        try state.handle_key(&buf, .{ .code = .character, .char = ch });
+    }
+    // Cursor jumped to "end"
+    try testing.expect(state.cursor.col > 2);
+
+    // Press Escape to cancel: cursor must restore to starting position (col 2)
+    try state.handle_key(&buf, .{ .code = .escape });
+    try testing.expectEqual(Mode.normal, state.mode);
+    try testing.expectEqual(@as(usize, 2), state.cursor.col);
+    try testing.expect(state.hlsearch == false);
 }

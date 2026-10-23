@@ -28,9 +28,14 @@ However, navigation and manipulation across medium-to-large files requires high-
   - `find_in_range(buf, start_offset, end_offset, pattern)`: Returns all match spans located entirely within the visible viewport slice.
 
 #### Modal Input Integration (`src/input/vim.zig`)
-- `/`: Activates search forward command prompt in status bar.
-- `?`: Activates search backward command prompt in status bar.
-- `<CR>` in search prompt: Stores search pattern in editor state, jumps cursor to the first match in direction, scrolls viewport if needed.
+- `/`: Activates search forward command prompt in status bar and saves cursor position.
+- `?`: Activates search backward command prompt in status bar and saves cursor position.
+- **Incremental Search (`incsearch`)**:
+  - Live query updates as user types every character (or deletes with backspace).
+  - Cursor previews the first matching location in real-time.
+  - Active screen highlights light up dynamically on every keystroke.
+  - `<Esc>`: Cancels incremental search, restores cursor to pre-search origin, and clears highlights.
+  - `<CR>`: Commits search at the current match.
 - `n`: Jumps to next match in current search direction.
 - `N`: Jumps to previous match (reverse of current search direction).
 - `*`: Extracts word/identifier under cursor, sets forward search pattern, jumps to next match.
