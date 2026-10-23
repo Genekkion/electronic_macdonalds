@@ -24,6 +24,7 @@ void macos_window_attach_editor_view(
 );
 void macos_window_set_cursor(void *win, int line, int col);
 void macos_window_set_cursor_mode(void *win, int line, int col, int mode);
+void macos_window_set_command_cursor(void *win, int col);
 void macos_window_set_status_line(void *win, const char *status_text);
 void macos_window_set_selection(
     void *win,

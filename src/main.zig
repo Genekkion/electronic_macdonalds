@@ -193,7 +193,9 @@ fn updateUi() void {
         ) catch return;
         defer std.heap.c_allocator.free(status);
         macos.macos_window_set_status_line(win, status.ptr);
+        macos.macos_window_set_command_cursor(win, @intCast(1 + g_editor.cmd_cursor));
     } else {
+        macos.macos_window_set_command_cursor(win, -1);
         const maybe_pending = getLuaPendingKey(std.heap.c_allocator);
         if (maybe_pending) |p| {
             defer std.heap.c_allocator.free(p);
@@ -265,6 +267,9 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         124 => ev.code = .right,
         125 => ev.code = .down,
         126 => ev.code = .up,
+        117 => ev.code = .delete,
+        115 => ev.code = .home,
+        119 => ev.code = .end,
         else => {
             if (chars != null and chars[0] != 0) {
                 ev.code = .character;

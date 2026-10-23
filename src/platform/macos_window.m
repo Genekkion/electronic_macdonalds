@@ -34,6 +34,7 @@
 @property (nonatomic, assign) int cursorLine;
 @property (nonatomic, assign) int cursorCol;
 @property (nonatomic, assign) int mode;
+@property (nonatomic, assign) int cmdCursorCol;
 @property (nonatomic, copy) NSString *statusText;
 @property (nonatomic, assign) BOOL hasSelection;
 @property (nonatomic, assign) BOOL isLineSelection;
@@ -59,6 +60,7 @@
         _cursorLine = 0;
         _cursorCol = 0;
         _mode = 0;
+        _cmdCursorCol = -1;
         _statusText = @"";
         _cursorVisible = YES;
 
@@ -213,28 +215,21 @@
         }
     }
 
-    // 3. Draw cursor
+    // 3. Draw buffer cursor (block for Normal, bar for Insert, subtle preview block for Command-line)
     if (_cursorVisible) {
+        CGFloat cursorX = 10.0 + _cursorCol * _charWidth;
+        CGFloat cursorY = _cursorLine * _lineHeight;
+        CGFloat cursorW = (_mode == 1) ? 2.0 : _charWidth;
+        NSRect cursorRect = NSMakeRect(cursorX, cursorY, cursorW, _lineHeight);
         if (_mode == 3) {
-            // Command-line mode: draw bar cursor directly on the status bar
-            CGFloat textLen = _statusText ? (CGFloat)[_statusText length] : 0.0;
-            CGFloat cursorX = 10.0 + textLen * _charWidth;
-            CGFloat cursorY = statusY + 3.0;
-            NSRect cursorRect = NSMakeRect(cursorX, cursorY, 2.0, _lineHeight);
-            CGContextSetRGBFillColor(context, 0.4, 0.7, 1.0, 0.9);
-            CGContextFillRect(context, cursorRect);
+            CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.40);
         } else {
-            // Buffer cursor (block for Normal, bar for Insert)
-            CGFloat cursorX = 10.0 + _cursorCol * _charWidth;
-            CGFloat cursorY = _cursorLine * _lineHeight;
-            CGFloat cursorW = (_mode == 1) ? 2.0 : _charWidth;
-            NSRect cursorRect = NSMakeRect(cursorX, cursorY, cursorW, _lineHeight);
             CGContextSetRGBFillColor(context, 0.32, 0.54, 1.0, 0.75);
-            CGContextFillRect(context, cursorRect);
         }
+        CGContextFillRect(context, cursorRect);
     }
 
-    // 4. Draw status line at bottom
+    // 4. Draw status line background at bottom
     NSRect statusRect = NSMakeRect(0, statusY, self.bounds.size.width, statusHeight);
     CGContextSetRGBFillColor(context, 0.15, 0.17, 0.21, 1.0);
     CGContextFillRect(context, statusRect);
@@ -244,6 +239,17 @@
     CGPoint points[2] = { CGPointMake(0, statusY), CGPointMake(self.bounds.size.width, statusY) };
     CGContextStrokeLineSegments(context, points, 2);
 
+    // 5. Draw command-line cursor on top of status bar background
+    if (_cursorVisible && _mode == 3) {
+        int cCol = (_cmdCursorCol >= 0) ? _cmdCursorCol : (_statusText ? (int)[_statusText length] : 0);
+        CGFloat cmdCursorX = 10.0 + cCol * _charWidth;
+        CGFloat cmdCursorY = statusY + 3.0;
+        NSRect cmdCursorRect = NSMakeRect(cmdCursorX, cmdCursorY, _charWidth, _lineHeight);
+        CGContextSetRGBFillColor(context, 0.35, 0.60, 0.95, 0.85);
+        CGContextFillRect(context, cmdCursorRect);
+    }
+
+    // 6. Draw status text
     if (_statusText && _statusText.length > 0) {
         NSColor *statusColor = (_mode == 1)
             ? [NSColor colorWithCalibratedRed:0.35 green:0.85 blue:0.45 alpha:1.0]
@@ -351,6 +357,17 @@ void macos_window_set_cursor_mode(void *win, int line, int col, int mode) {
             view.cursorLine = line;
             view.cursorCol = col;
             view.mode = mode;
+            [view setNeedsDisplay:YES];
+        }
+    }
+}
+
+void macos_window_set_command_cursor(void *win, int col) {
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win;
+        if ([[window contentView] isKindOfClass:[EditorView class]]) {
+            EditorView *view = (EditorView *)[window contentView];
+            view.cmdCursorCol = col;
             [view setNeedsDisplay:YES];
         }
     }

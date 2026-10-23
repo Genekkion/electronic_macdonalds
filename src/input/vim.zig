@@ -38,6 +38,7 @@ pub const EditorState = struct {
     pending_cmd: ?u8 = null,
     cmd_line: [256]u8 = [_]u8{0} ** 256,
     cmd_len: usize = 0,
+    cmd_cursor: usize = 0,
     last_cmd: [256]u8 = [_]u8{0} ** 256,
     last_cmd_len: usize = 0,
     register: [4096]u8 = [_]u8{0} ** 4096,
@@ -403,9 +404,30 @@ pub const EditorState = struct {
                 }
                 self.mode = .normal;
                 self.cmd_len = 0;
+                self.cmd_cursor = 0;
             },
-            .backspace => {
-                if (self.cmd_len > 0) {
+            .left => {
+                if (self.cmd_cursor > 0) {
+                    self.cmd_cursor -= 1;
+                }
+            },
+            .right => {
+                if (self.cmd_cursor < self.cmd_len) {
+                    self.cmd_cursor += 1;
+                }
+            },
+            .home => {
+                self.cmd_cursor = 0;
+            },
+            .end => {
+                self.cmd_cursor = self.cmd_len;
+            },
+            .delete => {
+                if (self.cmd_cursor < self.cmd_len) {
+                    var i: usize = self.cmd_cursor;
+                    while (i + 1 < self.cmd_len) : (i += 1) {
+                        self.cmd_line[i] = self.cmd_line[i + 1];
+                    }
                     self.cmd_len -= 1;
                     if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
                         if (self.cmd_len > 0) {
@@ -420,12 +442,36 @@ pub const EditorState = struct {
                             self.cursor = self.search_origin;
                         }
                     }
-                } else {
+                }
+            },
+            .backspace => {
+                if (self.cmd_cursor > 0) {
+                    var i: usize = self.cmd_cursor - 1;
+                    while (i + 1 < self.cmd_len) : (i += 1) {
+                        self.cmd_line[i] = self.cmd_line[i + 1];
+                    }
+                    self.cmd_len -= 1;
+                    self.cmd_cursor -= 1;
+                    if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                        if (self.cmd_len > 0) {
+                            @memcpy(self.search_pattern[0..self.cmd_len], self.cmd_line[0..self.cmd_len]);
+                            self.search_len = self.cmd_len;
+                            self.hlsearch = true;
+                            self.cursor = self.search_origin;
+                            _ = self.jump_to_match(buf, self.search_dir, false);
+                        } else {
+                            self.search_len = 0;
+                            self.hlsearch = false;
+                            self.cursor = self.search_origin;
+                        }
+                    }
+                } else if (self.cmd_len == 0) {
                     if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
                         self.cursor = self.search_origin;
                         self.hlsearch = false;
                     }
                     self.mode = .normal;
+                    self.cmd_cursor = 0;
                 }
             },
             .enter => {
@@ -434,6 +480,7 @@ pub const EditorState = struct {
                     @memcpy(self.last_cmd[1 .. 1 + self.cmd_len], self.cmd_line[0..self.cmd_len]);
                     self.last_cmd_len = 1 + self.cmd_len;
                     self.cmd_len = 0;
+                    self.cmd_cursor = 0;
                     self.mode = .normal;
                 } else if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
                     if (self.cmd_len > 0) {
@@ -442,21 +489,41 @@ pub const EditorState = struct {
                         self.hlsearch = true;
                     }
                     self.cmd_len = 0;
+                    self.cmd_cursor = 0;
                     self.mode = .normal;
                     _ = self.jump_to_match(buf, self.search_dir, false);
                 }
             },
             .character => {
                 if (ev.char) |ch| {
-                    if (self.cmd_len < self.cmd_line.len) {
-                        self.cmd_line[self.cmd_len] = ch;
-                        self.cmd_len += 1;
+                    if (ch == 1) { // Ctrl-A
+                        self.cmd_cursor = 0;
+                    } else if (ch == 5) { // Ctrl-E
+                        self.cmd_cursor = self.cmd_len;
+                    } else if (ch == 3) { // Ctrl-C
                         if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
-                            @memcpy(self.search_pattern[0..self.cmd_len], self.cmd_line[0..self.cmd_len]);
-                            self.search_len = self.cmd_len;
-                            self.hlsearch = true;
                             self.cursor = self.search_origin;
-                            _ = self.jump_to_match(buf, self.search_dir, false);
+                            self.hlsearch = false;
+                        }
+                        self.mode = .normal;
+                        self.cmd_len = 0;
+                        self.cmd_cursor = 0;
+                    } else if (ch >= 32) {
+                        if (self.cmd_len < self.cmd_line.len) {
+                            var i: usize = self.cmd_len;
+                            while (i > self.cmd_cursor) : (i -= 1) {
+                                self.cmd_line[i] = self.cmd_line[i - 1];
+                            }
+                            self.cmd_line[self.cmd_cursor] = ch;
+                            self.cmd_len += 1;
+                            self.cmd_cursor += 1;
+                            if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                                @memcpy(self.search_pattern[0..self.cmd_len], self.cmd_line[0..self.cmd_len]);
+                                self.search_len = self.cmd_len;
+                                self.hlsearch = true;
+                                self.cursor = self.search_origin;
+                                _ = self.jump_to_match(buf, self.search_dir, false);
+                            }
                         }
                     }
                 }
@@ -577,11 +644,13 @@ pub const EditorState = struct {
                         self.mode = .command_line;
                         self.cmd_prefix = ':';
                         self.cmd_len = 0;
+                        self.cmd_cursor = 0;
                     },
                     '/' => {
                         self.mode = .command_line;
                         self.cmd_prefix = '/';
                         self.cmd_len = 0;
+                        self.cmd_cursor = 0;
                         self.search_dir = .forward;
                         self.search_origin = self.cursor;
                     },
@@ -589,6 +658,7 @@ pub const EditorState = struct {
                         self.mode = .command_line;
                         self.cmd_prefix = '?';
                         self.cmd_len = 0;
+                        self.cmd_cursor = 0;
                         self.search_dir = .backward;
                         self.search_origin = self.cursor;
                     },
@@ -1246,4 +1316,48 @@ test "test_vim_incremental_search_escape_cancels" {
     try testing.expectEqual(Mode.normal, state.mode);
     try testing.expectEqual(@as(usize, 2), state.cursor.col);
     try testing.expect(state.hlsearch == false);
+}
+
+test "test_vim_command_line_cursor_navigation_and_editing" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var state = EditorState{};
+    // Enter command-line mode with ':'
+    try state.handle_key(&buf, .{ .code = .character, .char = ':' });
+    try testing.expectEqual(@as(usize, 0), state.cmd_cursor);
+    try testing.expectEqual(@as(usize, 0), state.cmd_len);
+
+    // Type "wh"
+    try state.handle_key(&buf, .{ .code = .character, .char = 'w' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'h' });
+    try testing.expectEqual(@as(usize, 2), state.cmd_cursor);
+    try testing.expectEqualStrings("wh", state.get_cmd_line());
+
+    // Left arrow moves cursor between 'w' and 'h'
+    try state.handle_key(&buf, .{ .code = .left });
+    try testing.expectEqual(@as(usize, 1), state.cmd_cursor);
+
+    // Type 'a' in the middle -> "wah"
+    try state.handle_key(&buf, .{ .code = .character, .char = 'a' });
+    try testing.expectEqual(@as(usize, 2), state.cmd_cursor);
+    try testing.expectEqualStrings("wah", state.get_cmd_line());
+
+    // Backspace deletes 'a' -> "wh"
+    try state.handle_key(&buf, .{ .code = .backspace });
+    try testing.expectEqual(@as(usize, 1), state.cmd_cursor);
+    try testing.expectEqualStrings("wh", state.get_cmd_line());
+
+    // Home moves to start
+    try state.handle_key(&buf, .{ .code = .home });
+    try testing.expectEqual(@as(usize, 0), state.cmd_cursor);
+
+    // Delete at start deletes 'w' -> "h"
+    try state.handle_key(&buf, .{ .code = .delete });
+    try testing.expectEqual(@as(usize, 0), state.cmd_cursor);
+    try testing.expectEqualStrings("h", state.get_cmd_line());
+
+    // End moves to end
+    try state.handle_key(&buf, .{ .code = .end });
+    try testing.expectEqual(@as(usize, 1), state.cmd_cursor);
 }
