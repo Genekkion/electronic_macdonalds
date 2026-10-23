@@ -6,6 +6,7 @@ const KeyEvent = @import("event.zig").KeyEvent;
 const KeyCode = @import("event.zig").KeyCode;
 const clipboard = @import("../platform/clipboard.zig");
 const search_mod = @import("../buffer/search.zig");
+const history_mod = @import("history.zig");
 
 fn get_line_len(buf: *const Buffer, line_idx: usize) usize {
     const start = buf.lines.get_line_start(line_idx) orelse return 0;
@@ -51,6 +52,7 @@ pub const EditorState = struct {
     search_dir: search_mod.Direction = .forward,
     hlsearch: bool = false,
     search_origin: Cursor = .{},
+    history: history_mod.HistoryStore = .{},
 
     pub fn get_search_pattern(self: *const EditorState) []const u8 {
         return self.search_pattern[0..self.search_len];
@@ -435,13 +437,74 @@ pub const EditorState = struct {
     fn handle_command_line_key(self: *EditorState, buf: *Buffer, ev: KeyEvent) void {
         switch (ev.code) {
             .escape => {
-                if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                if (self.cmd_prefix == ':') {
+                    self.history.commands.reset_nav();
+                } else if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                    self.history.searches.reset_nav();
                     self.cursor = self.search_origin;
                     self.hlsearch = false;
                 }
                 self.mode = .normal;
                 self.cmd_len = 0;
                 self.cmd_cursor = 0;
+            },
+            .up => {
+                const item_opt = if (self.cmd_prefix == ':')
+                    self.history.commands.navigate_up(self.get_cmd_line())
+                else if (self.cmd_prefix == '/' or self.cmd_prefix == '?')
+                    self.history.searches.navigate_up(self.get_cmd_line())
+                else
+                    null;
+
+                if (item_opt) |item| {
+                    const clen = @min(item.len, self.cmd_line.len);
+                    @memcpy(self.cmd_line[0..clen], item[0..clen]);
+                    self.cmd_len = clen;
+                    self.cmd_cursor = clen;
+
+                    if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                        if (self.cmd_len > 0) {
+                            @memcpy(self.search_pattern[0..self.cmd_len], self.cmd_line[0..self.cmd_len]);
+                            self.search_len = self.cmd_len;
+                            self.hlsearch = true;
+                            self.cursor = self.search_origin;
+                            _ = self.jump_to_match(buf, self.search_dir, false);
+                        } else {
+                            self.search_len = 0;
+                            self.hlsearch = false;
+                            self.cursor = self.search_origin;
+                        }
+                    }
+                }
+            },
+            .down => {
+                const item_opt = if (self.cmd_prefix == ':')
+                    self.history.commands.navigate_down()
+                else if (self.cmd_prefix == '/' or self.cmd_prefix == '?')
+                    self.history.searches.navigate_down()
+                else
+                    null;
+
+                if (item_opt) |item| {
+                    const clen = @min(item.len, self.cmd_line.len);
+                    @memcpy(self.cmd_line[0..clen], item[0..clen]);
+                    self.cmd_len = clen;
+                    self.cmd_cursor = clen;
+
+                    if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                        if (self.cmd_len > 0) {
+                            @memcpy(self.search_pattern[0..self.cmd_len], self.cmd_line[0..self.cmd_len]);
+                            self.search_len = self.cmd_len;
+                            self.hlsearch = true;
+                            self.cursor = self.search_origin;
+                            _ = self.jump_to_match(buf, self.search_dir, false);
+                        } else {
+                            self.search_len = 0;
+                            self.hlsearch = false;
+                            self.cursor = self.search_origin;
+                        }
+                    }
+                }
             },
             .left => {
                 if (self.cmd_cursor > 0) {
@@ -461,6 +524,11 @@ pub const EditorState = struct {
             },
             .delete => {
                 if (self.cmd_cursor < self.cmd_len) {
+                    if (self.cmd_prefix == ':') {
+                        self.history.commands.reset_nav();
+                    } else if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                        self.history.searches.reset_nav();
+                    }
                     var i: usize = self.cmd_cursor;
                     while (i + 1 < self.cmd_len) : (i += 1) {
                         self.cmd_line[i] = self.cmd_line[i + 1];
@@ -483,6 +551,11 @@ pub const EditorState = struct {
             },
             .backspace => {
                 if (self.cmd_cursor > 0) {
+                    if (self.cmd_prefix == ':') {
+                        self.history.commands.reset_nav();
+                    } else if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                        self.history.searches.reset_nav();
+                    }
                     var i: usize = self.cmd_cursor - 1;
                     while (i + 1 < self.cmd_len) : (i += 1) {
                         self.cmd_line[i] = self.cmd_line[i + 1];
@@ -503,9 +576,12 @@ pub const EditorState = struct {
                         }
                     }
                 } else if (self.cmd_len == 0) {
-                    if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                    if (self.cmd_prefix == ':') {
+                        self.history.commands.reset_nav();
+                    } else if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
                         self.cursor = self.search_origin;
                         self.hlsearch = false;
+                        self.history.searches.reset_nav();
                     }
                     self.mode = .normal;
                     self.cmd_cursor = 0;
@@ -513,6 +589,10 @@ pub const EditorState = struct {
             },
             .enter => {
                 if (self.cmd_prefix == ':') {
+                    if (self.cmd_len > 0) {
+                        self.history.commands.add(self.get_cmd_line());
+                    }
+                    self.history.commands.reset_nav();
                     self.last_cmd[0] = ':';
                     @memcpy(self.last_cmd[1 .. 1 + self.cmd_len], self.cmd_line[0..self.cmd_len]);
                     self.last_cmd_len = 1 + self.cmd_len;
@@ -521,10 +601,12 @@ pub const EditorState = struct {
                     self.mode = .normal;
                 } else if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
                     if (self.cmd_len > 0) {
+                        self.history.searches.add(self.get_cmd_line());
                         @memcpy(self.search_pattern[0..self.cmd_len], self.cmd_line[0..self.cmd_len]);
                         self.search_len = self.cmd_len;
                         self.hlsearch = true;
                     }
+                    self.history.searches.reset_nav();
                     self.cmd_len = 0;
                     self.cmd_cursor = 0;
                     self.mode = .normal;
@@ -538,7 +620,10 @@ pub const EditorState = struct {
                     } else if (ch == 5) { // Ctrl-E
                         self.cmd_cursor = self.cmd_len;
                     } else if (ch == 3) { // Ctrl-C
-                        if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                        if (self.cmd_prefix == ':') {
+                            self.history.commands.reset_nav();
+                        } else if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                            self.history.searches.reset_nav();
                             self.cursor = self.search_origin;
                             self.hlsearch = false;
                         }
@@ -547,6 +632,11 @@ pub const EditorState = struct {
                         self.cmd_cursor = 0;
                     } else if (ch >= 32) {
                         if (self.cmd_len < self.cmd_line.len) {
+                            if (self.cmd_prefix == ':') {
+                                self.history.commands.reset_nav();
+                            } else if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                                self.history.searches.reset_nav();
+                            }
                             var i: usize = self.cmd_len;
                             while (i > self.cmd_cursor) : (i -= 1) {
                                 self.cmd_line[i] = self.cmd_line[i - 1];
@@ -714,6 +804,7 @@ pub const EditorState = struct {
                             self.cmd_prefix = ':';
                             self.cmd_len = 0;
                             self.cmd_cursor = 0;
+                            self.history.commands.reset_nav();
                         },
                         '/' => {
                             self.mode = .command_line;
@@ -722,6 +813,7 @@ pub const EditorState = struct {
                             self.cmd_cursor = 0;
                             self.search_dir = .forward;
                             self.search_origin = self.cursor;
+                            self.history.searches.reset_nav();
                         },
                         '?' => {
                             self.mode = .command_line;
@@ -730,6 +822,7 @@ pub const EditorState = struct {
                             self.cmd_cursor = 0;
                             self.search_dir = .backward;
                             self.search_origin = self.cursor;
+                            self.history.searches.reset_nav();
                         },
                         'n' => {
                             var step: usize = 0;
@@ -1497,4 +1590,140 @@ test "test_vim_motion_count_prefix_j_and_k" {
     try state.handle_key(&buf, .{ .code = .character, .char = '2' });
     try state.handle_key(&buf, .{ .code = .character, .char = 'k' });
     try testing.expectEqual(@as(usize, 2), state.cursor.line);
+}
+
+test "test_vim_command_line_history_cycling" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "content\n");
+
+    var state = EditorState{};
+
+    // Execute :w
+    try state.handle_key(&buf, .{ .code = .character, .char = ':' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'w' });
+    try state.handle_key(&buf, .{ .code = .enter });
+    try testing.expectEqual(Mode.normal, state.mode);
+
+    // Execute :wq
+    try state.handle_key(&buf, .{ .code = .character, .char = ':' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'w' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'q' });
+    try state.handle_key(&buf, .{ .code = .enter });
+    try testing.expectEqual(Mode.normal, state.mode);
+
+    // Enter command mode and cycle with Up/Down
+    try state.handle_key(&buf, .{ .code = .character, .char = ':' });
+    try testing.expectEqualStrings("", state.get_cmd_line());
+
+    try state.handle_key(&buf, .{ .code = .up });
+    try testing.expectEqualStrings("wq", state.get_cmd_line());
+
+    try state.handle_key(&buf, .{ .code = .up });
+    try testing.expectEqualStrings("w", state.get_cmd_line());
+
+    // Can't go higher than oldest
+    try state.handle_key(&buf, .{ .code = .up });
+    try testing.expectEqualStrings("w", state.get_cmd_line());
+
+    // Navigate down
+    try state.handle_key(&buf, .{ .code = .down });
+    try testing.expectEqualStrings("wq", state.get_cmd_line());
+
+    // Navigate down back to draft
+    try state.handle_key(&buf, .{ .code = .down });
+    try testing.expectEqualStrings("", state.get_cmd_line());
+}
+
+test "test_vim_command_line_prefix_filtered_cycling" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "content\n");
+
+    var state = EditorState{};
+    state.history.commands.add("set number");
+    state.history.commands.add("write");
+    state.history.commands.add("set relativenumber");
+    state.history.commands.add("quit");
+
+    // Open colon prompt and type "set "
+    try state.handle_key(&buf, .{ .code = .character, .char = ':' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 's' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 'e' });
+    try state.handle_key(&buf, .{ .code = .character, .char = 't' });
+    try state.handle_key(&buf, .{ .code = .character, .char = ' ' });
+    try testing.expectEqualStrings("set ", state.get_cmd_line());
+
+    // Up arrow matches only commands starting with "set "
+    try state.handle_key(&buf, .{ .code = .up });
+    try testing.expectEqualStrings("set relativenumber", state.get_cmd_line());
+
+    try state.handle_key(&buf, .{ .code = .up });
+    try testing.expectEqualStrings("set number", state.get_cmd_line());
+
+    // Can't go higher
+    try state.handle_key(&buf, .{ .code = .up });
+    try testing.expectEqualStrings("set number", state.get_cmd_line());
+
+    // Down arrow back to "set relativenumber" then to original draft "set "
+    try state.handle_key(&buf, .{ .code = .down });
+    try testing.expectEqualStrings("set relativenumber", state.get_cmd_line());
+
+    try state.handle_key(&buf, .{ .code = .down });
+    try testing.expectEqualStrings("set ", state.get_cmd_line());
+}
+
+test "test_vim_search_history_cycling_and_live_preview" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "first line with apple\nsecond line with orange\nthird line with banana\n");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 0 } };
+
+    // Search /apple<Enter>
+    try state.handle_key(&buf, .{ .code = .character, .char = '/' });
+    for ("apple") |ch| {
+        try state.handle_key(&buf, .{ .code = .character, .char = ch });
+    }
+    try state.handle_key(&buf, .{ .code = .enter });
+    try testing.expectEqual(@as(usize, 0), state.cursor.line);
+    try testing.expectEqual(@as(usize, 16), state.cursor.col);
+
+    // Search /banana<Enter>
+    try state.handle_key(&buf, .{ .code = .character, .char = '/' });
+    for ("banana") |ch| {
+        try state.handle_key(&buf, .{ .code = .character, .char = ch });
+    }
+    try state.handle_key(&buf, .{ .code = .enter });
+    try testing.expectEqual(@as(usize, 2), state.cursor.line);
+    try testing.expectEqual(@as(usize, 16), state.cursor.col);
+
+    // Reset cursor to 0,0 and open /
+    state.cursor = .{ .line = 0, .col = 0 };
+    try state.handle_key(&buf, .{ .code = .character, .char = '/' });
+    try testing.expectEqualStrings("", state.get_cmd_line());
+
+    // Up arrow selects "banana" and live preview jumps to line 2, col 16
+    try state.handle_key(&buf, .{ .code = .up });
+    try testing.expectEqualStrings("banana", state.get_cmd_line());
+    try testing.expectEqual(@as(usize, 2), state.cursor.line);
+    try testing.expectEqual(@as(usize, 16), state.cursor.col);
+
+    // Up arrow selects "apple" and live preview jumps to line 0, col 16
+    try state.handle_key(&buf, .{ .code = .up });
+    try testing.expectEqualStrings("apple", state.get_cmd_line());
+    try testing.expectEqual(@as(usize, 0), state.cursor.line);
+    try testing.expectEqual(@as(usize, 16), state.cursor.col);
+
+    // Down arrow returns to "banana"
+    try state.handle_key(&buf, .{ .code = .down });
+    try testing.expectEqualStrings("banana", state.get_cmd_line());
+    try testing.expectEqual(@as(usize, 2), state.cursor.line);
+    try testing.expectEqual(@as(usize, 16), state.cursor.col);
+
+    // Down arrow returns to empty draft -> cursor restored to search_origin (0,0)
+    try state.handle_key(&buf, .{ .code = .down });
+    try testing.expectEqualStrings("", state.get_cmd_line());
+    try testing.expectEqual(@as(usize, 0), state.cursor.line);
+    try testing.expectEqual(@as(usize, 0), state.cursor.col);
 }

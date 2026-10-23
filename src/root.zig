@@ -20,6 +20,7 @@ pub const keymap = @import("input/keymap.zig");
 pub const cursor = @import("input/cursor.zig");
 pub const mode = @import("input/mode.zig");
 pub const vim = @import("input/vim.zig");
+pub const history = @import("input/history.zig");
 pub const clipboard = @import("platform/clipboard.zig");
 
 test {
@@ -33,6 +34,7 @@ test {
     _ = @import("input/cursor.zig");
     _ = @import("input/mode.zig");
     _ = @import("input/vim.zig");
+    _ = @import("input/history.zig");
     _ = @import("platform/clipboard.zig");
     _ = @import("buffer/undo.zig");
     _ = @import("buffer/undo_persist.zig");

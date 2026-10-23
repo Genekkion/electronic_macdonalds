@@ -270,6 +270,17 @@ fn updateUi() void {
     }
 }
 
+fn saveHistory(allocator: std.mem.Allocator) void {
+    if (root.history.HistoryStore.get_default_path(allocator)) |hist_path| {
+        defer allocator.free(hist_path);
+        g_editor.history.save_to_file(allocator, hist_path) catch {};
+    } else |_| {}
+}
+
+fn onWindowClose() callconv(.c) void {
+    saveHistory(std.heap.c_allocator);
+}
+
 fn getLineCallback(ctx: ?*anyopaque, line_idx: c_int, out_len: ?*c_int) callconv(.c) [*c]const u8 {
     _ = ctx;
     const buf = g_active_buffer orelse return null;
@@ -330,6 +341,7 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         switch (feed_res) {
             .matched => {
                 if (root.lua.is_quit_requested()) {
+                    saveHistory(std.heap.c_allocator);
                     std.c.exit(0);
                 }
                 if (root.lua.get_active_buffer_id()) |new_id| {
@@ -353,7 +365,9 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         }
     }
 
-    const was_colon_cmd = (g_editor.mode == .command_line and g_editor.cmd_prefix == ':');
+    const was_cmd_line = (g_editor.mode == .command_line);
+    const was_colon_cmd = (was_cmd_line and g_editor.cmd_prefix == ':');
+    const was_search_cmd = (was_cmd_line and (g_editor.cmd_prefix == '/' or g_editor.cmd_prefix == '?'));
     var cmd_copy: [256]u8 = undefined;
     var cmd_len: usize = 0;
     if (was_colon_cmd and ev.code == .enter) {
@@ -363,6 +377,10 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
     }
 
     g_editor.handle_key(buf, ev) catch {};
+
+    if ((was_colon_cmd or was_search_cmd) and ev.code == .enter) {
+        saveHistory(std.heap.c_allocator);
+    }
 
     if (was_colon_cmd and ev.code == .enter and g_lua != null) {
         root.lua.set_internal_cursor(g_editor.cursor.line, g_editor.cursor.col);
@@ -384,6 +402,7 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         }
 
         if (root.lua.is_quit_requested()) {
+            saveHistory(std.heap.c_allocator);
             std.c.exit(0);
         }
 
@@ -406,6 +425,12 @@ pub fn main() !void {
     const allocator = std.heap.c_allocator;
 
     std.debug.print("Initializing Electronic Macdonalds...\n", .{});
+
+    // 0. Load Command and Search History
+    if (root.history.HistoryStore.get_default_path(allocator)) |hist_path| {
+        defer allocator.free(hist_path);
+        g_editor.history.load_from_file(allocator, hist_path) catch {};
+    } else |_| {}
 
     // Initialize system clipboard handlers
     root.clipboard.set_handlers(macosClipboardSet, macosClipboardGet);
@@ -461,6 +486,7 @@ pub fn main() !void {
     const window = macos.macos_window_create("Electronic Macdonalds", 1024, 768);
     if (window == null) return error.WindowCreateFailed;
     g_window = window;
+    macos.macos_window_set_close_callback(window, onWindowClose);
 
     macos.macos_window_attach_editor_view(
         window,
