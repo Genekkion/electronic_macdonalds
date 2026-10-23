@@ -120,6 +120,12 @@ editor.create_command("w", function(args)
         return
     end
 
+    -- Check if file was modified externally
+    if (not args or args == "" or args == cur_buf:get_path()) and cur_buf.check_external_change and cur_buf:check_external_change() then
+        editor.set_error("WARNING: File changed on disk since last read (add ! to override, or run :DiffConflict)")
+        return
+    end
+
     local ok, err, msg = cur_buf:save(path)
     if ok then
         editor.set_status('"' .. path .. '" written')
@@ -128,22 +134,119 @@ editor.create_command("w", function(args)
     end
 end)
 
---- Open a path (file or directory)
-function editor.edit_path(path)
+-- :w! [path] - Force save overriding external changes
+editor.create_command("w!", function(args)
+    local cur_buf = editor.get_current_buffer()
+    if not cur_buf then
+        editor.set_error("No buffer to write")
+        return
+    end
+
+    if editor.oil and editor.oil.is_oil_buffer(cur_buf) and (not args or args == "") then
+        editor.oil.save(cur_buf)
+        return
+    end
+
+    local path = args
     if not path or path == "" then
-        local cur = editor.get_current_buffer()
-        if cur and cur.get_path and cur:get_path() and cur:get_path() ~= "" then
-            path = cur:get_path()
+        path = (cur_buf.get_path and cur_buf:get_path()) or ""
+    end
+
+    if path == "" then
+        editor.set_error("No file name")
+        return
+    end
+
+    local ok, err, msg = cur_buf:save(path)
+    if ok then
+        editor.set_status('"' .. path .. '" written')
+    else
+        editor.set_error("Write error: " .. tostring(msg or err))
+    end
+end)
+
+-- :DiffConflict - 3-way merge in-memory edits with disk changes using Git markers
+editor.create_command("DiffConflict", function()
+    local cur = editor.get_current_buffer()
+    if not cur then return end
+    if not cur.diff_conflict then
+        editor.set_error("diff_conflict not available")
+        return
+    end
+
+    local has_conflict, count = cur:diff_conflict()
+    if has_conflict then
+        editor.set_error(string.format("Found %d conflict(s); inserted Git markers (<<<<<<<, =======, >>>>>>>)", count))
+    else
+        editor.set_status("Merged external changes cleanly with no conflicts")
+    end
+end)
+
+--- Check for external modifications and reload clean buffers
+function editor.checktime()
+    if editor.log then editor.log("commands.lua: editor.checktime() called") end
+    local cur = editor.get_current_buffer()
+    if not cur then
+        if editor.log then editor.log("  -> no current buffer") end
+        return false
+    end
+    local changed = cur.check_external_change and cur:check_external_change()
+    if editor.log then editor.log("  -> cur:check_external_change() = " .. tostring(changed)) end
+    if changed then
+        local dirty, _, _ = cur:is_dirty()
+        local name = (cur.get_path and cur:get_path()) or "buffer"
+        if editor.log then editor.log("  -> is_dirty = " .. tostring(dirty) .. ", name = " .. tostring(name)) end
+        if not dirty then
+            local ok, err, msg = cur:reload()
+            if editor.log then editor.log("  -> cur:reload() = " .. tostring(ok) .. ", err = " .. tostring(err) .. ", msg = " .. tostring(msg)) end
+            if ok then
+                editor.set_status('"' .. name .. '" reloaded from disk')
+                return true
+            else
+                editor.set_error('Failed to reload "' .. name .. '": ' .. tostring(msg or err or "unknown"))
+            end
         else
-            editor.set_error("No file name")
-            return false
+            editor.set_error('Warning: File "' .. name .. '" changed on disk with unsaved changes. Run :DiffConflict or :e! to reload')
         end
+    end
+    return false
+end
+
+-- :checktime - check for external modifications
+editor.create_command("checktime", function()
+    editor.checktime()
+end)
+
+--- Open a path (file or directory)
+function editor.edit_path(path, force)
+    local cur = editor.get_current_buffer()
+    local cur_path = (cur and cur.get_path and cur:get_path()) or ""
+
+    if not path or path == "" then
+        path = cur_path
     end
 
     path = path:match("^%s*(.-)%s*$")
     if path == "" then
         editor.set_error("No file name")
         return false
+    end
+
+    -- Reloading the current buffer
+    if cur and cur_path == path then
+        local dirty, _, _ = cur:is_dirty()
+        if dirty and not force then
+            editor.set_error("No write since last change (add ! to override)")
+            return false
+        end
+        local ok, err, msg = cur:reload()
+        if ok then
+            editor.set_status('"' .. path .. '" reloaded')
+            return true
+        else
+            editor.set_error("Failed to reload: " .. tostring(msg or err))
+            return false
+        end
     end
 
     -- Check if directory
@@ -157,6 +260,9 @@ function editor.edit_path(path)
     for _, b_info in ipairs(editor.list_buffers()) do
         local b = editor.get_buffer_by_id(b_info.id)
         if b and b.get_path and b:get_path() == path then
+            if force then
+                b:reload()
+            end
             editor.set_current_buffer(b)
             return true
         end
@@ -186,11 +292,20 @@ end
 
 -- :e [path] / :edit [path]
 editor.create_command("e", function(args)
-    editor.edit_path(args)
+    editor.edit_path(args, false)
 end)
 
 editor.create_command("edit", function(args)
-    editor.edit_path(args)
+    editor.edit_path(args, false)
+end)
+
+-- :e! [path] / :edit! [path] - force reload
+editor.create_command("e!", function(args)
+    editor.edit_path(args, true)
+end)
+
+editor.create_command("edit!", function(args)
+    editor.edit_path(args, true)
 end)
 
 -- :Oil [path]

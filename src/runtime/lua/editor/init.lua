@@ -92,7 +92,7 @@ editor.keymap.set("n", "<CR>", function()
     return false
 end)
 
-editor.keymap.set("n", "<leader>gg", function()
+editor.keymap.set("n", "<leader>g", function()
     if not editor.oil then return end
     local cur_buf = editor.get_current_buffer()
     if cur_buf and editor.oil.is_oil_buffer(cur_buf) then

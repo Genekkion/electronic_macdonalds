@@ -9,6 +9,7 @@ pub const BufferRegistry = @import("buffer/registry.zig").BufferRegistry;
 pub const undo = @import("buffer/undo.zig");
 pub const undo_persist = @import("buffer/undo_persist.zig");
 pub const search = @import("buffer/search.zig");
+pub const patience = @import("buffer/patience.zig");
 
 pub const lua = @import("lua/buffer_binding.zig");
 pub const config = @import("lua/config.zig");
@@ -42,6 +43,7 @@ test {
     _ = @import("buffer/undo.zig");
     _ = @import("buffer/undo_persist.zig");
     _ = @import("buffer/search.zig");
+    _ = @import("buffer/patience.zig");
     _ = @import("lua/config.zig");
     _ = @import("lua/events.zig");
     _ = @import("lua/fs.zig");

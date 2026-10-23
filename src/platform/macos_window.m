@@ -1,5 +1,10 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
+#import <objc/runtime.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdarg.h>
+#include <time.h>
 #include "macos_window.h"
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
@@ -12,14 +17,39 @@
 @end
 
 @interface WindowDelegate : NSObject <NSWindowDelegate>
+@property (nonatomic, weak) NSWindow *window;
 @property (nonatomic, assign) WindowCloseCallback closeCallback;
+@property (nonatomic, strong) dispatch_source_t vnodeSource;
+@property (nonatomic, copy) NSString *watchedPath;
+@property (nonatomic, assign) FileChangedCallback fileChangedCallback;
+- (void)stopWatching;
 @end
 
 @implementation WindowDelegate
+- (void)stopWatching {
+    if (self.vnodeSource) {
+        em_log("stopWatching called, canceling source: %p", self.vnodeSource);
+        dispatch_source_cancel(self.vnodeSource);
+        self.vnodeSource = nil;
+    }
+    self.watchedPath = nil;
+}
+
 - (void)windowWillClose:(NSNotification *)notification {
+    [self stopWatching];
     if (self.closeCallback) {
         self.closeCallback();
     }
+}
+
+- (void)windowDidBecomeKey:(NSNotification *)notification {
+    if (self.fileChangedCallback && self.watchedPath) {
+        self.fileChangedCallback([self.watchedPath UTF8String]);
+    }
+}
+
+- (void)dealloc {
+    [self stopWatching];
 }
 @end
 
@@ -378,12 +408,91 @@ void *macos_window_create(const char *title, int width, int height) {
     }
 }
 
+static char const * const kWindowDelegateKey = "kWindowDelegateKey";
+
+static WindowDelegate *getOrCreateWindowDelegate(NSWindow *window) {
+    WindowDelegate *delegate = (WindowDelegate *)objc_getAssociatedObject(window, kWindowDelegateKey);
+    if (!delegate) {
+        delegate = [[WindowDelegate alloc] init];
+        delegate.window = window;
+        objc_setAssociatedObject(window, kWindowDelegateKey, delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [window setDelegate:delegate];
+    }
+    return delegate;
+}
+
 void macos_window_set_close_callback(void *win, WindowCloseCallback cb) {
     @autoreleasepool {
         NSWindow *window = (__bridge NSWindow *)win;
-        WindowDelegate *delegate = [[WindowDelegate alloc] init];
+        WindowDelegate *delegate = getOrCreateWindowDelegate(window);
         delegate.closeCallback = cb;
-        [window setDelegate:delegate];
+    }
+}
+
+void macos_window_set_file_watch(void *win, const char *path, FileChangedCallback cb) {
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win;
+        WindowDelegate *delegate = getOrCreateWindowDelegate(window);
+
+        em_log("macos_window_set_file_watch requested for path: %s", path ? path : "(null)");
+        [delegate stopWatching];
+        delegate.fileChangedCallback = cb;
+
+        if (!path || path[0] == '\0' || !cb) {
+            return;
+        }
+
+        int fd = open(path, O_EVTONLY);
+        if (fd < 0) {
+            em_log("  -> open('%s', O_EVTONLY) failed with errno %d (%s)", path, errno, strerror(errno));
+            return;
+        }
+
+        NSString *pathStr = [NSString stringWithUTF8String:path];
+        delegate.watchedPath = pathStr;
+
+        dispatch_source_t source = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_VNODE,
+            (uintptr_t)fd,
+            DISPATCH_VNODE_DELETE | DISPATCH_VNODE_WRITE | DISPATCH_VNODE_EXTEND | DISPATCH_VNODE_ATTRIB | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_REVOKE,
+            dispatch_get_main_queue()
+        );
+
+        if (!source) {
+            em_log("  -> dispatch_source_create failed for fd: %d", fd);
+            close(fd);
+            return;
+        }
+
+        em_log("  -> dispatch_source %p created successfully for fd %d on '%s'", source, fd, path);
+
+        __weak WindowDelegate *weakDelegate = delegate;
+        dispatch_source_set_event_handler(source, ^{
+            WindowDelegate *strongDelegate = weakDelegate;
+            if (!strongDelegate || !strongDelegate.fileChangedCallback || !strongDelegate.watchedPath) {
+                return;
+            }
+            unsigned long flags = dispatch_source_get_data(source);
+            em_log("vnode event_handler triggered for '%s', flags: 0x%lx (WRITE=%d, DELETE=%d, RENAME=%d, ATTRIB=%d, REVOKE=%d)",
+                   [strongDelegate.watchedPath UTF8String], flags,
+                   (flags & DISPATCH_VNODE_WRITE) != 0,
+                   (flags & DISPATCH_VNODE_DELETE) != 0,
+                   (flags & DISPATCH_VNODE_RENAME) != 0,
+                   (flags & DISPATCH_VNODE_ATTRIB) != 0,
+                   (flags & DISPATCH_VNODE_REVOKE) != 0);
+
+            FileChangedCallback savedCb = strongDelegate.fileChangedCallback;
+            NSString *savedPath = [strongDelegate.watchedPath copy];
+            savedCb([savedPath UTF8String]);
+        });
+
+        dispatch_source_set_cancel_handler(source, ^{
+            em_log("cancel_handler executed: closing fd %d for source %p", fd, source);
+            close(fd);
+        });
+
+        delegate.vnodeSource = source;
+        dispatch_resume(source);
     }
 }
 

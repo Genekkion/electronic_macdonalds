@@ -5,6 +5,21 @@ pub const Marker = @import("marker.zig").Marker;
 pub const LineIndex = @import("line_index.zig").LineIndex;
 pub const undo_mod = @import("undo.zig");
 pub const undo_persist_mod = @import("undo_persist.zig");
+pub const patience_mod = @import("patience.zig");
+
+const posix_c = @cImport({
+    @cInclude("sys/stat.h");
+    @cInclude("unistd.h");
+});
+
+pub extern "c" fn usleep(usec: c_uint) c_int;
+pub extern "c" fn em_log(fmt: [*c]const u8, ...) void;
+
+fn get_file_mtime(path: [*:0]const u8) ?i128 {
+    var st: posix_c.struct_stat = undefined;
+    if (posix_c.stat(path, &st) != 0) return null;
+    return @as(i128, st.st_mtimespec.tv_sec) * 1_000_000_000 + @as(i128, st.st_mtimespec.tv_nsec);
+}
 
 pub const Buffer = struct {
     allocator: Allocator,
@@ -16,6 +31,8 @@ pub const Buffer = struct {
     is_dirty: bool = false,
     file_path: ?[:0]const u8 = null,
     name: ?[]const u8 = null,
+    mtime: i128 = 0,
+    base_snapshot: ?[]u8 = null,
     undo_tree: undo_mod.UndoTree,
     group_active: bool = false,
     group_offset: usize = 0,
@@ -69,6 +86,9 @@ pub const Buffer = struct {
         }
         if (self.name) |n| {
             self.allocator.free(n);
+        }
+        if (self.base_snapshot) |bs| {
+            self.allocator.free(bs);
         }
         self.markers.deinit(self.allocator);
         self.lines.deinit();
@@ -327,7 +347,10 @@ pub const Buffer = struct {
 
     pub fn save_to_file(self: *Buffer, path: [:0]const u8) FileError!void {
         const f = std.c.fopen(path.ptr, "wb") orelse return error.FileOpenFailed;
-        defer _ = std.c.fclose(f);
+        var closed = false;
+        defer if (!closed) {
+            _ = std.c.fclose(f);
+        };
 
         // Write pre-gap segment
         if (self.gap_start > 0) {
@@ -342,12 +365,26 @@ pub const Buffer = struct {
             if (written < post_len) return error.WriteFailed;
         }
 
+        _ = std.c.fclose(f);
+        closed = true;
+
         if (self.file_path) |old_p| {
             self.allocator.free(old_p);
         }
         self.file_path = self.allocator.dupeZ(u8, path) catch null;
         self.is_dirty = false;
         self.undo_tree.mark_saved();
+
+        if (self.file_path) |p| {
+            if (get_file_mtime(p.ptr)) |mt| {
+                self.mtime = mt;
+            }
+        }
+        if (self.base_snapshot) |bs| {
+            self.allocator.free(bs);
+            self.base_snapshot = null;
+        }
+        self.base_snapshot = self.get_slice(self.allocator, 0, self.len()) catch null;
 
         // Persist undo history
         if (undo_persist_mod.get_undo_path_for_file(self.allocator, path)) |undo_path| {
@@ -395,6 +432,13 @@ pub const Buffer = struct {
         buf.is_dirty = false;
         buf.undo_tree.mark_saved();
 
+        if (buf.file_path) |p| {
+            if (get_file_mtime(p.ptr)) |mt| {
+                buf.mtime = mt;
+            }
+        }
+        buf.base_snapshot = buf.get_slice(allocator, 0, buf.len()) catch null;
+
         // Restore undo history if available and matches content
         if (undo_persist_mod.get_undo_path_for_file(allocator, path)) |undo_path| {
             defer allocator.free(undo_path);
@@ -406,6 +450,109 @@ pub const Buffer = struct {
         } else |_| {}
 
         return buf;
+    }
+
+    pub fn check_external_change(self: *const Buffer) bool {
+        const p = self.file_path orelse return false;
+        const current_mt = get_file_mtime(p.ptr);
+        if (self.mtime == 0) {
+            const has_ext = (current_mt != null);
+            em_log("buffer.zig: check_external_change mtime==0 for '%s', on_disk=%d", p.ptr, if (has_ext) @as(c_int, 1) else @as(c_int, 0));
+            return has_ext;
+        }
+        const mt = current_mt orelse {
+            em_log("buffer.zig: check_external_change file deleted on disk for '%s'", p.ptr);
+            return true;
+        };
+        const changed = (mt != self.mtime);
+        em_log("buffer.zig: check_external_change for '%s': cached=%lld, disk=%lld, changed=%d",
+               p.ptr,
+               @as(c_longlong, @truncate(self.mtime)),
+               @as(c_longlong, @truncate(mt)),
+               if (changed) @as(c_int, 1) else @as(c_int, 0));
+        return changed;
+    }
+
+    pub fn reload(self: *Buffer) !void {
+        const p = self.file_path orelse return error.FileNotFound;
+        em_log("buffer.zig: reload() called for '%s'", p.ptr);
+        var f = std.c.fopen(p.ptr, "rb");
+        if (f == null) {
+            em_log("buffer.zig: fopen failed initially for '%s', retrying in 15ms...", p.ptr);
+            _ = usleep(15_000); // 15ms
+            f = std.c.fopen(p.ptr, "rb");
+        }
+        const file = f orelse {
+            em_log("buffer.zig: fopen failed completely for '%s'", p.ptr);
+            return error.FileNotFound;
+        };
+        defer _ = std.c.fclose(file);
+
+        _ = fseek(file, 0, 2); // SEEK_END
+        const size_long = ftell(file);
+        if (size_long < 0) return error.ReadFailed;
+        const file_size: usize = @intCast(size_long);
+        _ = fseek(file, 0, 0); // SEEK_SET
+
+        try self.delete(0, self.len());
+
+        if (file_size > 0) {
+            const temp = try self.allocator.alloc(u8, file_size);
+            defer self.allocator.free(temp);
+
+            var read_bytes = std.c.fread(temp.ptr, 1, file_size, file);
+            if (read_bytes < file_size) {
+                _ = usleep(10_000);
+                _ = fseek(file, 0, 0);
+                read_bytes = std.c.fread(temp.ptr, 1, file_size, file);
+                if (read_bytes < file_size) return error.ReadFailed;
+            }
+
+            try self.insert_raw(0, temp[0..read_bytes]);
+        }
+
+        self.is_dirty = false;
+        self.undo_tree.mark_saved();
+
+        if (get_file_mtime(p.ptr)) |mt| {
+            self.mtime = mt;
+            em_log("buffer.zig: reload() updated cached mtime to %lld for '%s'", @as(c_longlong, @truncate(mt)), p.ptr);
+        }
+
+        if (self.base_snapshot) |bs| {
+            self.allocator.free(bs);
+            self.base_snapshot = null;
+        }
+        self.base_snapshot = self.get_slice(self.allocator, 0, self.len()) catch null;
+    }
+
+    pub fn merge_with_disk(self: *const Buffer, allocator: Allocator) !patience_mod.MergeResult {
+        const p = self.file_path orelse return error.FileNotFound;
+        const f = std.c.fopen(p.ptr, "rb") orelse return error.FileNotFound;
+        defer _ = std.c.fclose(f);
+
+        _ = fseek(f, 0, 2); // SEEK_END
+        const size_long = ftell(f);
+        if (size_long < 0) return error.ReadFailed;
+        const file_size: usize = @intCast(size_long);
+        _ = fseek(f, 0, 0); // SEEK_SET
+
+        var disk_content: []u8 = "";
+        if (file_size > 0) {
+            disk_content = try allocator.alloc(u8, file_size);
+            const read_bytes = std.c.fread(disk_content.ptr, 1, file_size, f);
+            if (read_bytes < file_size) {
+                allocator.free(disk_content);
+                return error.ReadFailed;
+            }
+        }
+        defer if (file_size > 0) allocator.free(disk_content);
+
+        const base_text = self.base_snapshot orelse "";
+        const mine_text = try self.get_slice(allocator, 0, self.len());
+        defer allocator.free(mine_text);
+
+        return patience_mod.merge3(allocator, base_text, mine_text, disk_content, "In-Memory", "Disk");
     }
 };
 
@@ -659,4 +806,107 @@ test "test_buffer_save_and_load_restores_undo_history" {
         try testing.expectEqualStrings("line one\nline two\n", redo_content);
         try testing.expect(!buf2.is_dirty);
     }
+}
+
+test "test_buffer_mtime_cached_on_load_and_save" {
+    const test_path = "/tmp/em_mtime_test.txt";
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+
+    try buf.insert(0, "initial content\n");
+    try buf.save_to_file(test_path);
+
+    try testing.expect(buf.mtime > 0);
+    try testing.expect(buf.base_snapshot != null);
+    try testing.expectEqualStrings("initial content\n", buf.base_snapshot.?);
+    try testing.expect(!buf.check_external_change());
+
+    var buf_loaded = try Buffer.load_from_file(testing.allocator, test_path);
+    defer buf_loaded.deinit();
+
+    try testing.expect(buf_loaded.mtime > 0);
+    try testing.expect(buf_loaded.base_snapshot != null);
+    try testing.expectEqualStrings("initial content\n", buf_loaded.base_snapshot.?);
+    try testing.expect(!buf_loaded.check_external_change());
+
+    _ = std.c.unlink(test_path);
+}
+
+test "test_buffer_check_external_change_detects_modification" {
+    const test_path = "/tmp/em_mtime_change_test.txt";
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+
+    try buf.insert(0, "baseline\n");
+    try buf.save_to_file(test_path);
+    try testing.expect(!buf.check_external_change());
+
+    // Wait slightly to ensure filesystem timestamp differs
+    _ = usleep(50_000);
+
+    // Modify file externally on disk
+    const f = std.c.fopen(test_path, "wb") orelse return error.FileOpenFailed;
+    _ = std.c.fwrite("external edit\n".ptr, 1, 14, f);
+    _ = std.c.fclose(f);
+
+    try testing.expect(buf.check_external_change());
+
+    _ = std.c.unlink(test_path);
+}
+
+test "test_buffer_reload_clears_dirty_and_updates_snapshot" {
+    const test_path = "/tmp/em_reload_test.txt";
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+
+    try buf.insert(0, "before reload\n");
+    try buf.save_to_file(test_path);
+
+    _ = usleep(50_000);
+
+    // External overwrite
+    const f = std.c.fopen(test_path, "wb") orelse return error.FileOpenFailed;
+    _ = std.c.fwrite("reloaded content\n".ptr, 1, 17, f);
+    _ = std.c.fclose(f);
+
+    try buf.insert(0, "local dirty change\n");
+    try testing.expect(buf.is_dirty);
+
+    try buf.reload();
+
+    try testing.expect(!buf.is_dirty);
+    const slice = try buf.get_slice(testing.allocator, 0, buf.len());
+    defer testing.allocator.free(slice);
+    try testing.expectEqualStrings("reloaded content\n", slice);
+    try testing.expect(!buf.check_external_change());
+
+    _ = std.c.unlink(test_path);
+}
+
+test "test_buffer_diff3_with_disk" {
+    const test_path = "/tmp/em_diff3_disk_test.txt";
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+
+    try buf.insert(0, "line 1\n");
+    try buf.save_to_file(test_path);
+
+    _ = usleep(50_000);
+
+    // External disk modification
+    const f = std.c.fopen(test_path, "wb") orelse return error.FileOpenFailed;
+    _ = std.c.fwrite("line 1 external\n".ptr, 1, 16, f);
+    _ = std.c.fclose(f);
+
+    // Local in-memory edit
+    try buf.delete(0, buf.len());
+    try buf.insert(0, "line 1 edited\n");
+
+    var res = try buf.merge_with_disk(testing.allocator);
+    defer res.deinit();
+
+    try testing.expect(res.has_conflicts);
+    try testing.expect(std.mem.indexOf(u8, res.text, "<<<<<<< In-Memory") != null);
+
+    _ = std.c.unlink(test_path);
 }

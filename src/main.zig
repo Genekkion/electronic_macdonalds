@@ -281,6 +281,43 @@ fn onWindowClose() callconv(.c) void {
     saveHistory(std.heap.c_allocator);
 }
 
+fn onFileChangedCallback(path: [*c]const u8) callconv(.c) void {
+    macos.em_log("main.zig: onFileChangedCallback triggered for path '%s'", path);
+    const L = g_lua orelse return;
+
+    _ = c.lua_getglobal(L, "editor");
+    _ = c.lua_getfield(L, -1, "checktime");
+    if (c.lua_isfunction(L, -1)) {
+        if (c.lua_pcallk(L, 0, 1, 0, 0, null) == 0) {
+            c.lua_pop(L, 1);
+        } else {
+            c.lua_pop(L, 1);
+        }
+    } else {
+        c.lua_pop(L, 1);
+    }
+    c.lua_pop(L, 1);
+
+    updateUi();
+    updateFileWatch();
+}
+
+fn updateFileWatch() void {
+    const win = g_window orelse return;
+    const buf = g_active_buffer orelse {
+        macos.em_log("main.zig: updateFileWatch buf is null, stopping watch");
+        macos.macos_window_set_file_watch(win, null, null);
+        return;
+    };
+    if (buf.file_path) |p| {
+        macos.em_log("main.zig: updateFileWatch setting watch for '%s'", p.ptr);
+        macos.macos_window_set_file_watch(win, p.ptr, onFileChangedCallback);
+    } else {
+        macos.em_log("main.zig: updateFileWatch buf has no file_path, stopping watch");
+        macos.macos_window_set_file_watch(win, null, null);
+    }
+}
+
 fn getLineCallback(ctx: ?*anyopaque, line_idx: c_int, out_len: ?*c_int) callconv(.c) [*c]const u8 {
     _ = ctx;
     const buf = g_active_buffer orelse return null;
@@ -351,6 +388,7 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
                             if (g_active_buffer != new_buf) {
                                 g_active_buffer = new_buf;
                                 g_editor.cursor = .{};
+                                updateFileWatch();
                             }
                         }
                     }
@@ -440,6 +478,7 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         }
 
         root.lua.set_internal_cursor(g_editor.cursor.line, g_editor.cursor.col);
+        updateFileWatch();
     }
 
     updateUi();
@@ -544,6 +583,7 @@ pub fn main() !void {
         onKeyDownCallback,
     );
     updateUi();
+    updateFileWatch();
 
     std.debug.print("Window ready with Lua-powered Vim commands (:w, :q, :q!, :echo).\n", .{});
     macos.macos_app_run();

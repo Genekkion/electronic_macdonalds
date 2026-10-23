@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
         .files = &.{
             "macos_window.m",
             "macos_font.m",
+            "em_log.c",
         },
         .flags = &.{
             "-fobjc-arc",
@@ -116,6 +117,7 @@ pub fn build(b: *std.Build) void {
         .root = b.path("src/platform"),
         .files = &.{
             "macos_font.m",
+            "em_log.c",
         },
         .flags = &.{
             "-fobjc-arc",

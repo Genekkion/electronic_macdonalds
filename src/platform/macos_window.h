@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 typedef void (*WindowCloseCallback)(void);
+typedef void (*FileChangedCallback)(const char *path);
 typedef const char *(*GetLineCallback)(void *ctx, int line_idx, int *out_len);
 typedef int (*GetLineCountCallback)(void *ctx);
 typedef void (*KeyDownCallback)(void *ctx, const char *chars, int key_code, int mods);
@@ -15,6 +16,7 @@ typedef void (*KeyDownCallback)(void *ctx, const char *chars, int key_code, int 
 bool macos_app_init(void);
 void *macos_window_create(const char *title, int width, int height);
 void macos_window_set_close_callback(void *win, WindowCloseCallback cb);
+void macos_window_set_file_watch(void *win, const char *path, FileChangedCallback cb);
 void macos_window_attach_editor_view(
     void *win,
     void *ctx,
@@ -48,6 +50,7 @@ const char *macos_clipboard_get(int *out_len);
 void macos_window_redraw(void *win);
 bool macos_app_poll_events(void);
 void macos_app_run(void);
+void em_log(const char *fmt, ...);
 
 #ifdef __cplusplus
 }

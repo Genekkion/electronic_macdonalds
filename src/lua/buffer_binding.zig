@@ -48,6 +48,9 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
         .{ .name = "replace", .func = lua_replace },
         .{ .name = "undo", .func = lua_buf_undo },
         .{ .name = "redo", .func = lua_buf_redo },
+        .{ .name = "check_external_change", .func = lua_check_external_change },
+        .{ .name = "reload", .func = lua_buf_reload },
+        .{ .name = "diff_conflict", .func = lua_diff_conflict },
         .{ .name = null, .func = null },
     };
     c.luaL_setfuncs(L, &methods, 0);
@@ -95,6 +98,7 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
         .{ .name = "dispatch_key_combo", .func = lua_dispatch_key_combo },
         .{ .name = "is_dir", .func = fs.lua_is_dir },
         .{ .name = "read_dir", .func = fs.lua_read_dir },
+        .{ .name = "log", .func = lua_log },
         .{ .name = "fs_rename", .func = fs.lua_fs_rename },
         .{ .name = "fs_delete", .func = fs.lua_fs_delete },
         .{ .name = "fs_mkdir", .func = fs.lua_fs_mkdir },
@@ -415,6 +419,17 @@ fn lua_set_current_buffer(L: ?*c.lua_State) callconv(.c) c_int {
 
 fn lua_is_quit_requested(L: ?*c.lua_State) callconv(.c) c_int {
     return result.push_success_bool(L, g_quit_requested);
+}
+
+extern "c" fn em_log(fmt: [*c]const u8, ...) void;
+
+fn lua_log(L: ?*c.lua_State) callconv(.c) c_int {
+    var len: usize = 0;
+    const str = c.lua_tolstring(L, 1, &len);
+    if (str != null) {
+        em_log("%s", str);
+    }
+    return 0;
 }
 
 var g_cursor_line: usize = 0;
@@ -831,6 +846,54 @@ fn lua_buf_redo(L: ?*c.lua_State) callconv(.c) c_int {
     };
     const step = buf.redo();
     return result.push_success_bool(L, step != null);
+}
+
+fn lua_check_external_change(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+    c.lua_pushboolean(L, if (buf.check_external_change()) 1 else 0);
+    return 1;
+}
+
+fn lua_buf_reload(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+    buf.reload() catch |err| switch (err) {
+        error.FileNotFound => return result.push_error(L, "FILE_NOT_FOUND", "file not found on disk"),
+        error.ReadFailed => return result.push_error(L, "READ_FAILED", "failed to read file"),
+        error.OutOfMemory => return result.push_error(L, "OUT_OF_MEMORY", "out of memory"),
+        else => return result.push_error(L, "IO_ERROR", "failed to reload buffer"),
+    };
+    return result.push_success_bool(L, true);
+}
+
+fn lua_diff_conflict(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+    const registry = global_registry orelse return result.push_error(L, "INTERNAL_ERROR", "registry not initialized");
+    var m_res = buf.merge_with_disk(registry.allocator) catch |err| switch (err) {
+        error.FileNotFound => return result.push_error(L, "FILE_NOT_FOUND", "file not found"),
+        error.OutOfMemory => return result.push_error(L, "OUT_OF_MEMORY", "out of memory"),
+        else => return result.push_error(L, "MERGE_FAILED", "merge failed"),
+    };
+    defer m_res.deinit();
+
+    // Replace buffer content with merged text
+    buf.delete(0, buf.len()) catch return result.push_error(L, "INTERNAL_ERROR", "failed to clear buffer");
+    buf.insert(0, m_res.text) catch return result.push_error(L, "INTERNAL_ERROR", "failed to insert merged text");
+
+    c.lua_pushboolean(L, if (m_res.has_conflicts) 1 else 0);
+    c.lua_pushinteger(L, @intCast(m_res.conflict_count));
+    return 2;
 }
 
 // -----------------------------------------------------------------------------
@@ -1725,6 +1788,185 @@ test "test_lua_dash_in_file_does_not_trigger_oil" {
         \\local status, val = editor.keymap.feed("n", "-")
         \\assert(status == "nomatch")
         \\assert(editor.oil.is_oil_buffer(editor.get_current_buffer()) == false)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buf_check_external_change" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_ext_change.txt", false) end)
+        \\local buf, _, _ = editor.create_buffer()
+        \\buf:insert(0, "base content\n")
+        \\buf:save("/tmp/em_lua_ext_change.txt")
+        \\assert(buf:check_external_change() == false)
+        \\
+        \\-- Sleep slightly and modify file externally
+        \\local f = io.open("/tmp/em_lua_ext_change.txt", "w")
+        \\f:write("external write\n")
+        \\f:close()
+        \\
+        \\assert(buf:check_external_change() == true)
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_ext_change.txt", false) end)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buf_reload" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_reload.txt", false) end)
+        \\local buf, _, _ = editor.create_buffer()
+        \\buf:insert(0, "initial\n")
+        \\buf:save("/tmp/em_lua_reload.txt")
+        \\
+        \\local f = io.open("/tmp/em_lua_reload.txt", "w")
+        \\f:write("reloaded external\n")
+        \\f:close()
+        \\
+        \\buf:insert(0, "local dirty\n")
+        \\assert(buf:is_dirty() == true)
+        \\
+        \\local ok = buf:reload()
+        \\assert(ok == true)
+        \\assert(buf:is_dirty() == false)
+        \\assert(buf:get_slice(0, buf:len()) == "reloaded external\n")
+        \\assert(buf:check_external_change() == false)
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_reload.txt", false) end)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_buf_diff_conflict_injects_markers" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_diff_conflict.txt", false) end)
+        \\local buf, _, _ = editor.create_buffer()
+        \\buf:insert(0, "base line\n")
+        \\buf:save("/tmp/em_lua_diff_conflict.txt")
+        \\
+        \\-- External change on disk
+        \\local f = io.open("/tmp/em_lua_diff_conflict.txt", "w")
+        \\f:write("disk changed line\n")
+        \\f:close()
+        \\
+        \\-- Local in-memory edit
+        \\buf:delete(0, buf:len())
+        \\buf:insert(0, "in memory changed line\n")
+        \\
+        \\local has_conflict, count = buf:diff_conflict()
+        \\assert(has_conflict == true)
+        \\assert(count == 1)
+        \\local content = buf:get_slice(0, buf:len())
+        \\assert(content:find("<<<<<<< In%-Memory") ~= nil)
+        \\assert(content:find("in memory changed line") ~= nil)
+        \\assert(content:find("=======") ~= nil)
+        \\assert(content:find("disk changed line") ~= nil)
+        \\assert(content:find(">>>>>>> Disk") ~= nil)
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_diff_conflict.txt", false) end)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_save_blocked_when_disk_changed_unless_force" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_save_block.txt", false) end)
+        \\editor.dispatch_command(":e /tmp/em_lua_save_block.txt")
+        \\local cur = editor.get_current_buffer()
+        \\cur:insert(0, "original\n")
+        \\editor.dispatch_command(":w")
+        \\
+        \\-- External change on disk
+        \\local f = io.open("/tmp/em_lua_save_block.txt", "w")
+        \\f:write("external update\n")
+        \\f:close()
+        \\
+        \\-- Local edit
+        \\cur:insert(0, "local edit\n")
+        \\
+        \\-- Regular :w must fail and report conflict error
+        \\editor.dispatch_command(":w")
+        \\assert(editor.get_last_error():find("File changed on disk") ~= nil)
+        \\
+        \\-- Force :w! must succeed
+        \\editor.dispatch_command(":w!")
+        \\assert(editor.get_last_error() == "")
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_save_block.txt", false) end)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_checktime_command" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_checktime.txt", false) end)
+        \\editor.dispatch_command(":e /tmp/em_lua_checktime.txt")
+        \\local cur = editor.get_current_buffer()
+        \\cur:insert(0, "checktime baseline\n")
+        \\editor.dispatch_command(":w")
+        \\
+        \\-- External change
+        \\local f = io.open("/tmp/em_lua_checktime.txt", "w")
+        \\f:write("externally modified\n")
+        \\f:close()
+        \\
+        \\-- When clean: :checktime auto-reloads and notifies
+        \\editor.dispatch_command(":checktime")
+        \\assert(cur:get_slice(0, cur:len()) == "externally modified\n")
+        \\assert(editor.get_last_message():find("reloaded from disk") ~= nil)
+        \\
+        \\-- When dirty: :checktime warns without discarding edits
+        \\cur:insert(0, "dirty edit\n")
+        \\local f2 = io.open("/tmp/em_lua_checktime.txt", "w")
+        \\f2:write("another external modification\n")
+        \\f2:close()
+        \\
+        \\editor.dispatch_command(":checktime")
+        \\assert(cur:is_dirty() == true)
+        \\assert(editor.get_last_error():find("changed on disk") ~= nil)
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_checktime.txt", false) end)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_edit_reload_clean_and_dirty_handling" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_e_reload.txt", false) end)
+        \\editor.dispatch_command(":e /tmp/em_lua_e_reload.txt")
+        \\local cur = editor.get_current_buffer()
+        \\cur:insert(0, "baseline version\n")
+        \\editor.dispatch_command(":w")
+        \\
+        \\-- 1. Modify on disk externally
+        \\local f = io.open("/tmp/em_lua_e_reload.txt", "w")
+        \\f:write("version updated externally\n")
+        \\f:close()
+        \\
+        \\-- 2. :e on clean buffer reloads
+        \\editor.dispatch_command(":e")
+        \\assert(cur:get_slice(0, cur:len()) == "version updated externally\n")
+        \\assert(editor.get_last_message():find("reloaded") ~= nil)
+        \\
+        \\-- 3. Modify locally to make dirty
+        \\cur:insert(0, "local in-memory edit\n")
+        \\assert(cur:is_dirty() == true)
+        \\
+        \\-- 4. :e while dirty must be blocked
+        \\editor.dispatch_command(":e")
+        \\assert(editor.get_last_error():find("No write since last change") ~= nil)
+        \\
+        \\-- 5. :e! while dirty forces reload
+        \\editor.dispatch_command(":e!")
+        \\assert(cur:get_slice(0, cur:len()) == "version updated externally\n")
+        \\assert(cur:is_dirty() == false)
+        \\pcall(function() editor.fs_delete("/tmp/em_lua_e_reload.txt", false) end)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_reload_test_plan_md" {
+    const script =
+        \\local cur, err, msg = editor.read_file("./TEST_PLAN.md")
+        \\assert(cur ~= nil, tostring(msg or err))
+        \\editor.set_current_buffer(cur)
+        \\local ok, r_err, r_msg = cur:reload()
+        \\assert(ok == true, "reload failed: " .. tostring(r_msg or r_err))
     ;
     try run_lua_test(script);
 }
