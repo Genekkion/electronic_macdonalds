@@ -25,7 +25,16 @@ function editor.dispatch_command(line)
     end
 
     -- Extract command name (including optional !) and remainder arguments
-    local name, args = raw:match("^(%S+)%s*(.-)$")
+    local name, args
+    if raw:match("^%%s%A") then
+        name = "%s"
+        args = raw:sub(3)
+    elseif raw:match("^s%A") then
+        name = "s"
+        args = raw:sub(2)
+    else
+        name, args = raw:match("^(%S+)%s*(.-)$")
+    end
     if not name then
         return false
     end
@@ -131,6 +140,81 @@ editor.create_command("e", function(path)
         editor.set_status('"' .. path .. '" opened')
     else
         editor.set_error("Cannot open file: " .. tostring(msg or err))
+    end
+end)
+
+local function parse_substitute(args)
+    if not args or args == "" then
+        return nil, "Missing substitute arguments"
+    end
+    local delim = args:sub(1, 1)
+    local parts = {}
+    local cur = ""
+    local escaped = false
+    for i = 2, #args do
+        local ch = args:sub(i, i)
+        if escaped then
+            cur = cur .. ch
+            escaped = false
+        elseif ch == "\\" then
+            escaped = true
+        elseif ch == delim then
+            table.insert(parts, cur)
+            cur = ""
+        else
+            cur = cur .. ch
+        end
+    end
+    table.insert(parts, cur)
+
+    local pat = parts[1] or ""
+    local rep = parts[2] or ""
+    local flags = parts[3] or ""
+    local all = flags:find("g") ~= nil
+    return { pattern = pat, replacement = rep, all = all }
+end
+
+-- :%s/<pat>/<rep>/[flags] - Substitute across whole buffer
+editor.create_command("%s", function(args)
+    local cur_buf = editor.get_current_buffer()
+    if not cur_buf then
+        editor.set_error("No buffer")
+        return
+    end
+
+    local sub, err = parse_substitute(args)
+    if not sub then
+        editor.set_error("Invalid substitute syntax: " .. tostring(err))
+        return
+    end
+
+    local count, _, msg = cur_buf:replace(sub.pattern, sub.replacement, 0, cur_buf:len(), sub.all)
+    if count then
+        editor.set_status(tostring(count) .. " substitution(s)")
+    else
+        editor.set_error("Substitution failed: " .. tostring(msg))
+    end
+end)
+
+-- :s/<pat>/<rep>/[flags] - Substitute
+editor.create_command("s", function(args)
+    local cur_buf = editor.get_current_buffer()
+    if not cur_buf then
+        editor.set_error("No buffer")
+        return
+    end
+
+    local sub, err = parse_substitute(args)
+    if not sub then
+        editor.set_error("Invalid substitute syntax: " .. tostring(err))
+        return
+    end
+
+    local count, _, msg = cur_buf:replace(sub.pattern, sub.replacement, 0, cur_buf:len(), sub.all)
+    if count then
+        editor.set_status(tostring(count) .. " substitution(s)")
+    else
+        editor.set_error("Substitution failed: " .. tostring(msg))
     end
 end)
 

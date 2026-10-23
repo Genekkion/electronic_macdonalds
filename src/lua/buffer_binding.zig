@@ -40,6 +40,9 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
         .{ .name = "get_id", .func = lua_get_id },
         .{ .name = "get_name", .func = lua_get_name },
         .{ .name = "get_path", .func = lua_get_path },
+        .{ .name = "replace", .func = lua_replace },
+        .{ .name = "undo", .func = lua_buf_undo },
+        .{ .name = "redo", .func = lua_buf_redo },
         .{ .name = null, .func = null },
     };
     c.luaL_setfuncs(L, &methods, 0);
@@ -686,6 +689,67 @@ fn lua_save(L: ?*c.lua_State) callconv(.c) c_int {
     return result.push_success_bool(L, true);
 }
 
+fn lua_replace(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+
+    var pat_len: usize = 0;
+    const pat_ptr = c.lua_tolstring(L, 2, &pat_len);
+    if (pat_ptr == null) return result.push_error(L, "INVALID_ARGUMENT", "expected pattern string");
+    const pattern = pat_ptr[0..pat_len];
+
+    var rep_len: usize = 0;
+    const rep_ptr = c.lua_tolstring(L, 3, &rep_len);
+    if (rep_ptr == null) return result.push_error(L, "INVALID_ARGUMENT", "expected replacement string");
+    const replacement = rep_ptr[0..rep_len];
+
+    const range_start: usize = if (c.lua_isinteger(L, 4) != 0) @intCast(@max(0, c.lua_tointegerx(L, 4, null))) else 0;
+    const range_end: usize = if (c.lua_isinteger(L, 5) != 0) @intCast(@max(0, c.lua_tointegerx(L, 5, null))) else buf.len();
+    const all = if (c.lua_isboolean(L, 6)) (c.lua_toboolean(L, 6) != 0) else true;
+
+    const search_mod = @import("../buffer/search.zig");
+    const replaced = search_mod.replace_in_range(
+        buf,
+        std.heap.c_allocator,
+        pattern,
+        replacement,
+        range_start,
+        range_end,
+        all,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return result.push_error(L, "OUT_OF_MEMORY", "out of memory"),
+        else => return result.push_error(L, "INTERNAL_ERROR", "replace failed"),
+    };
+
+    _ = c.lua_pushinteger(L, @intCast(replaced));
+    c.lua_pushnil(L);
+    c.lua_pushnil(L);
+    return 3;
+}
+
+fn lua_buf_undo(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+    const step = buf.undo();
+    return result.push_success_bool(L, step != null);
+}
+
+fn lua_buf_redo(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+    const step = buf.redo();
+    return result.push_success_bool(L, step != null);
+}
+
 // -----------------------------------------------------------------------------
 // Tests for Phase 2
 // -----------------------------------------------------------------------------
@@ -1166,6 +1230,31 @@ test "test_lua_undo_persistence_roundtrip" {
         \\assert(tree.seq_cur == 2)
         \\assert(#tree.entries >= 2)
         \\os.remove(test_file)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_substitute_commands" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\editor.set_current_buffer(buf)
+        \\buf:insert(0, "alpha beta alpha gamma")
+        \\
+        \\-- Replace first occurrence without 'g'
+        \\editor.dispatch_command(":s/alpha/OMEGA/")
+        \\local s1, _, _ = buf:get_slice(0, buf:len())
+        \\assert(s1 == "OMEGA beta alpha gamma")
+        \\
+        \\-- Replace all occurrences with 'g'
+        \\editor.dispatch_command(":%s/alpha/ZETA/g")
+        \\local s2, _, _ = buf:get_slice(0, buf:len())
+        \\assert(s2 == "OMEGA beta ZETA gamma")
+        \\
+        \\-- Undo works in a single step
+        \\local u_ok, _, _ = buf:undo()
+        \\assert(u_ok == true)
+        \\local s3, _, _ = buf:get_slice(0, buf:len())
+        \\assert(s3 == "OMEGA beta alpha gamma")
     ;
     try run_lua_test(script);
 }

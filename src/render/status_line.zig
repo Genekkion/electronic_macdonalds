@@ -20,8 +20,8 @@ pub fn format_status_line(
     return try allocator.dupeZ(u8, formatted);
 }
 
-pub fn format_command_line(allocator: Allocator, cmd: []const u8) ![:0]u8 {
-    const formatted = try std.fmt.allocPrint(allocator, ":{s}", .{cmd});
+pub fn format_command_line(allocator: Allocator, prefix: u8, cmd: []const u8) ![:0]u8 {
+    const formatted = try std.fmt.allocPrint(allocator, "{c}{s}", .{ prefix, cmd });
     defer allocator.free(formatted);
     return try allocator.dupeZ(u8, formatted);
 }
@@ -29,7 +29,7 @@ pub fn format_command_line(allocator: Allocator, cmd: []const u8) ![:0]u8 {
 const testing = std.testing;
 
 test "test_status_line_command_mode" {
-    const text = try format_command_line(testing.allocator, "w");
+    const text = try format_command_line(testing.allocator, ':', "w");
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(":w", text);
 }

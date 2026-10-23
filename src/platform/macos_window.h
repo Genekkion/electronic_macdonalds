@@ -34,6 +34,12 @@ void macos_window_set_selection(
     bool is_active,
     bool is_line
 );
+void macos_window_set_search_highlights(
+    void *win,
+    bool active,
+    const int *line_col_len,
+    int count
+);
 void macos_clipboard_set(const char *text, int len);
 const char *macos_clipboard_get(int *out_len);
 void macos_window_redraw(void *win);

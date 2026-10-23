@@ -159,10 +159,36 @@ fn updateUi() void {
         macos.macos_window_set_selection(win, 0, 0, 0, 0, false, false);
     }
 
+    if (g_editor.hlsearch and g_editor.get_search_pattern().len > 0) {
+        const matches = root.search.find_in_range(buf, 0, buf.len(), g_editor.get_search_pattern(), std.heap.c_allocator) catch null;
+        if (matches) |m_list| {
+            defer std.heap.c_allocator.free(m_list);
+            var triplets: [256 * 3]c_int = undefined;
+            var r_count: usize = 0;
+            for (m_list) |m| {
+                if (r_count >= 256) break;
+                const m_line = buf.lines.get_line_at_offset(m.offset) orelse continue;
+                const line_start = buf.lines.get_line_start(m_line) orelse 0;
+                const m_col = if (m.offset >= line_start) m.offset - line_start else 0;
+
+                triplets[r_count * 3 + 0] = @intCast(m_line);
+                triplets[r_count * 3 + 1] = @intCast(m_col);
+                triplets[r_count * 3 + 2] = @intCast(m.len);
+                r_count += 1;
+            }
+            macos.macos_window_set_search_highlights(win, true, &triplets, @intCast(r_count));
+        } else {
+            macos.macos_window_set_search_highlights(win, false, null, 0);
+        }
+    } else {
+        macos.macos_window_set_search_highlights(win, false, null, 0);
+    }
+
     if (g_editor.mode == .command_line) {
         const cmd_str = g_editor.get_cmd_line();
         const status = root.status_line.format_command_line(
             std.heap.c_allocator,
+            g_editor.cmd_prefix,
             cmd_str,
         ) catch return;
         defer std.heap.c_allocator.free(status);
@@ -282,10 +308,10 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         }
     }
 
-    const was_cmd = (g_editor.mode == .command_line);
+    const was_colon_cmd = (g_editor.mode == .command_line and g_editor.cmd_prefix == ':');
     var cmd_copy: [256]u8 = undefined;
     var cmd_len: usize = 0;
-    if (was_cmd and ev.code == .enter) {
+    if (was_colon_cmd and ev.code == .enter) {
         const raw_cmd = g_editor.get_cmd_line();
         cmd_len = @min(raw_cmd.len, cmd_copy.len);
         @memcpy(cmd_copy[0..cmd_len], raw_cmd[0..cmd_len]);
@@ -293,7 +319,7 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
 
     g_editor.handle_key(buf, ev) catch {};
 
-    if (was_cmd and ev.code == .enter and g_lua != null) {
+    if (was_colon_cmd and ev.code == .enter and g_lua != null) {
         const L = g_lua.?;
         _ = c.lua_getglobal(L, "editor");
         _ = c.lua_getfield(L, -1, "dispatch_command");

@@ -85,7 +85,7 @@ pub const Buffer = struct {
         return self.lines.count();
     }
 
-    fn move_gap(self: *Buffer, target: usize) void {
+    pub fn move_gap(self: *Buffer, target: usize) void {
         if (target == self.gap_start) return;
 
         if (target < self.gap_start) {

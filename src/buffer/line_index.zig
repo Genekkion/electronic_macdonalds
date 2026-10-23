@@ -36,6 +36,29 @@ pub const LineIndex = struct {
         return total_len;
     }
 
+    pub fn get_line_at_offset(self: *const LineIndex, offset: usize) ?usize {
+        const items = self.line_starts.items;
+        if (items.len == 0) return null;
+        if (offset < items[0]) return 0;
+        if (offset >= items[items.len - 1]) return items.len - 1;
+
+        var low: usize = 0;
+        var high: usize = items.len - 1;
+        while (low <= high) {
+            const mid = low + (high - low) / 2;
+            if (items[mid] <= offset) {
+                if (mid + 1 == items.len or items[mid + 1] > offset) {
+                    return mid;
+                }
+                low = mid + 1;
+            } else {
+                if (mid == 0) return 0;
+                high = mid - 1;
+            }
+        }
+        return low;
+    }
+
     pub fn on_insert(self: *LineIndex, offset: usize, bytes: []const u8) !void {
         if (bytes.len == 0) return;
 

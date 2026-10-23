@@ -5,6 +5,7 @@ const Mode = @import("mode.zig").Mode;
 const KeyEvent = @import("event.zig").KeyEvent;
 const KeyCode = @import("event.zig").KeyCode;
 const clipboard = @import("../platform/clipboard.zig");
+const search_mod = @import("../buffer/search.zig");
 
 fn get_line_len(buf: *const Buffer, line_idx: usize) usize {
     const start = buf.lines.get_line_start(line_idx) orelse return 0;
@@ -42,6 +43,73 @@ pub const EditorState = struct {
     register: [4096]u8 = [_]u8{0} ** 4096,
     register_len: usize = 0,
     register_is_line: bool = false,
+    cmd_prefix: u8 = ':',
+    search_pattern: [256]u8 = [_]u8{0} ** 256,
+    search_len: usize = 0,
+    search_dir: search_mod.Direction = .forward,
+    hlsearch: bool = false,
+
+    pub fn get_search_pattern(self: *const EditorState) []const u8 {
+        return self.search_pattern[0..self.search_len];
+    }
+
+    pub fn jump_to_match(self: *EditorState, buf: *const Buffer, dir: search_mod.Direction, advance: bool) bool {
+        const pat = self.get_search_pattern();
+        if (pat.len == 0) return false;
+
+        const cur_off = self.cursor.to_offset(buf) orelse 0;
+        const from_off = if (advance and dir == .forward) cur_off + 1 else cur_off;
+
+        const match_opt = switch (dir) {
+            .forward => search_mod.find_next(buf, from_off, pat),
+            .backward => search_mod.find_prev(buf, cur_off, pat),
+        };
+
+        if (match_opt) |m| {
+            if (self.cursor.from_offset(buf, m.offset)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn search_word_under_cursor(self: *EditorState, buf: *const Buffer, dir: search_mod.Direction) void {
+        const line_idx = self.cursor.line;
+        const start = buf.lines.get_line_start(line_idx) orelse return;
+        const end = buf.lines.get_line_end(line_idx, buf.len()) orelse return;
+        if (start >= end) return;
+
+        var line_buf: [1024]u8 = undefined;
+        const line_len = @min(end - start, line_buf.len);
+        for (0..line_len) |i| {
+            line_buf[i] = buf.byte_at(start + i) orelse break;
+        }
+        const line_text = line_buf[0..line_len];
+
+        const col = @min(self.cursor.col, if (line_len > 0) line_len - 1 else 0);
+        if (line_len == 0 or !is_word_char(line_text[col])) return;
+
+        var word_start = col;
+        while (word_start > 0 and is_word_char(line_text[word_start - 1])) {
+            word_start -= 1;
+        }
+
+        var word_end = col;
+        while (word_end < line_len and is_word_char(line_text[word_end])) {
+            word_end += 1;
+        }
+
+        const word = line_text[word_start..word_end];
+        if (word.len == 0) return;
+
+        const copy_len = @min(word.len, self.search_pattern.len);
+        @memcpy(self.search_pattern[0..copy_len], word[0..copy_len]);
+        self.search_len = copy_len;
+        self.search_dir = dir;
+        self.hlsearch = true;
+
+        _ = self.jump_to_match(buf, dir, true);
+    }
 
     pub fn get_cmd_line(self: *const EditorState) []const u8 {
         return self.cmd_line[0..self.cmd_len];
@@ -240,7 +308,7 @@ pub const EditorState = struct {
             .normal => try self.handle_normal_key(buf, ev),
             .insert => try self.handle_insert_key(buf, ev),
             .visual, .visual_line => try self.handle_visual_key(buf, ev),
-            .command_line => self.handle_command_line_key(ev),
+            .command_line => self.handle_command_line_key(buf, ev),
         }
     }
 
@@ -325,7 +393,7 @@ pub const EditorState = struct {
         }
     }
 
-    fn handle_command_line_key(self: *EditorState, ev: KeyEvent) void {
+    fn handle_command_line_key(self: *EditorState, buf: *Buffer, ev: KeyEvent) void {
         switch (ev.code) {
             .escape => {
                 self.mode = .normal;
@@ -339,11 +407,23 @@ pub const EditorState = struct {
                 }
             },
             .enter => {
-                self.last_cmd[0] = ':';
-                @memcpy(self.last_cmd[1 .. 1 + self.cmd_len], self.cmd_line[0..self.cmd_len]);
-                self.last_cmd_len = 1 + self.cmd_len;
-                self.cmd_len = 0;
-                self.mode = .normal;
+                if (self.cmd_prefix == ':') {
+                    self.last_cmd[0] = ':';
+                    @memcpy(self.last_cmd[1 .. 1 + self.cmd_len], self.cmd_line[0..self.cmd_len]);
+                    self.last_cmd_len = 1 + self.cmd_len;
+                    self.cmd_len = 0;
+                    self.mode = .normal;
+                } else if (self.cmd_prefix == '/' or self.cmd_prefix == '?') {
+                    if (self.cmd_len > 0) {
+                        @memcpy(self.search_pattern[0..self.cmd_len], self.cmd_line[0..self.cmd_len]);
+                        self.search_len = self.cmd_len;
+                    }
+                    self.search_dir = if (self.cmd_prefix == '/') .forward else .backward;
+                    self.hlsearch = true;
+                    self.cmd_len = 0;
+                    self.mode = .normal;
+                    _ = self.jump_to_match(buf, self.search_dir, false);
+                }
             },
             .character => {
                 if (ev.char) |ch| {
@@ -467,10 +547,37 @@ pub const EditorState = struct {
                     },
                     ':' => {
                         self.mode = .command_line;
+                        self.cmd_prefix = ':';
                         self.cmd_len = 0;
+                    },
+                    '/' => {
+                        self.mode = .command_line;
+                        self.cmd_prefix = '/';
+                        self.cmd_len = 0;
+                    },
+                    '?' => {
+                        self.mode = .command_line;
+                        self.cmd_prefix = '?';
+                        self.cmd_len = 0;
+                    },
+                    'n' => {
+                        _ = self.jump_to_match(buf, self.search_dir, true);
+                    },
+                    'N' => {
+                        const rev: search_mod.Direction = if (self.search_dir == .forward) .backward else .forward;
+                        _ = self.jump_to_match(buf, rev, true);
+                    },
+                    '*' => {
+                        self.search_word_under_cursor(buf, .forward);
+                    },
+                    '#' => {
+                        self.search_word_under_cursor(buf, .backward);
                     },
                     else => {},
                 };
+            },
+            .escape => {
+                self.hlsearch = false;
             },
             .left, .right, .down, .up => self.handle_arrow_key(buf, ev.code),
             else => {},
@@ -970,4 +1077,96 @@ test "test_vim_undo_resets_dirty_state" {
 
     try state.handle_key(&buf, .{ .code = .character, .char = 'u' });
     try testing.expect(buf.is_dirty == false);
+}
+
+test "test_vim_search_prompt_and_n_N_navigation" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "target one target two target three");
+
+    var state = EditorState{};
+
+    // Press '/' to start forward search
+    try state.handle_key(&buf, .{ .code = .character, .char = '/' });
+    try testing.expectEqual(Mode.command_line, state.mode);
+    try testing.expectEqual(@as(u8, '/'), state.cmd_prefix);
+
+    // Type "target"
+    for ("target") |ch| {
+        try state.handle_key(&buf, .{ .code = .character, .char = ch });
+    }
+    // Press Enter to execute search
+    try state.handle_key(&buf, .{ .code = .enter });
+
+    // Mode is back to normal, pattern is saved, hlsearch is on
+    try testing.expectEqual(Mode.normal, state.mode);
+    try testing.expectEqualStrings("target", state.get_search_pattern());
+    try testing.expect(state.hlsearch == true);
+
+    // Cursor jumped to first match at offset 0
+    try testing.expectEqual(@as(usize, 0), state.cursor.col);
+
+    // Press 'n' -> next match at offset 11
+    try state.handle_key(&buf, .{ .code = .character, .char = 'n' });
+    try testing.expectEqual(@as(usize, 11), state.cursor.col);
+
+    // Press 'n' -> next match at offset 22
+    try state.handle_key(&buf, .{ .code = .character, .char = 'n' });
+    try testing.expectEqual(@as(usize, 22), state.cursor.col);
+
+    // Press 'N' -> reverse direction back to offset 11
+    try state.handle_key(&buf, .{ .code = .character, .char = 'N' });
+    try testing.expectEqual(@as(usize, 11), state.cursor.col);
+}
+
+test "test_vim_star_hash_word_under_cursor" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "func foo() { return foo; }");
+
+    var state = EditorState{ .cursor = .{ .line = 0, .col = 5 } }; // Cursor is on "foo"
+    try state.handle_key(&buf, .{ .code = .character, .char = '*' });
+
+    try testing.expectEqualStrings("foo", state.get_search_pattern());
+    try testing.expect(state.hlsearch == true);
+    // Jumped forward to second "foo" at col 20
+    try testing.expectEqual(@as(usize, 20), state.cursor.col);
+
+    // Press '#' to search backward -> jumps back to first "foo" at col 5
+    try state.handle_key(&buf, .{ .code = .character, .char = '#' });
+    try testing.expectEqual(@as(usize, 5), state.cursor.col);
+}
+
+test "test_vim_escape_clears_hlsearch" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "content");
+
+    var state = EditorState{ .hlsearch = true };
+    try state.handle_key(&buf, .{ .code = .escape });
+    try testing.expect(state.hlsearch == false);
+}
+
+test "test_vim_smartcase_navigation" {
+    var buf = Buffer.init(testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "Apple and apple and APPLE");
+
+    var state = EditorState{};
+
+    // Lowercase search /apple matches "Apple" at col 0
+    try state.handle_key(&buf, .{ .code = .character, .char = '/' });
+    for ("apple") |ch| {
+        try state.handle_key(&buf, .{ .code = .character, .char = ch });
+    }
+    try state.handle_key(&buf, .{ .code = .enter });
+    try testing.expectEqual(@as(usize, 0), state.cursor.col);
+
+    // Caps search /APPLE matches strictly "APPLE" at col 20
+    try state.handle_key(&buf, .{ .code = .character, .char = '/' });
+    for ("APPLE") |ch| {
+        try state.handle_key(&buf, .{ .code = .character, .char = ch });
+    }
+    try state.handle_key(&buf, .{ .code = .enter });
+    try testing.expectEqual(@as(usize, 20), state.cursor.col);
 }

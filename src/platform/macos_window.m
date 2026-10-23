@@ -23,7 +23,10 @@
 }
 @end
 
-@interface EditorView : NSView
+@interface EditorView : NSView {
+@public
+    int _searchHighlights[256 * 3];
+}
 @property (nonatomic, assign) void *ctx;
 @property (nonatomic, assign) GetLineCallback getLineCb;
 @property (nonatomic, assign) GetLineCountCallback getLineCountCb;
@@ -38,6 +41,8 @@
 @property (nonatomic, assign) int selStartCol;
 @property (nonatomic, assign) int selEndLine;
 @property (nonatomic, assign) int selEndCol;
+@property (nonatomic, assign) BOOL hasSearchHighlights;
+@property (nonatomic, assign) int searchHighlightCount;
 @property (nonatomic, assign) BOOL cursorVisible;
 @property (nonatomic, strong) NSTimer *blinkTimer;
 @property (nonatomic, assign) CTFontRef font;
@@ -176,6 +181,22 @@
                 selRect = NSMakeRect(0, i * _lineHeight, self.bounds.size.width, _lineHeight);
             }
             CGContextFillRect(context, selRect);
+        }
+    }
+
+    // 2.5 Draw search highlights if active
+    if (_hasSearchHighlights && _searchHighlightCount > 0) {
+        CGContextSetRGBFillColor(context, 0.95, 0.75, 0.15, 0.40); // Soft amber gold
+        for (int i = 0; i < _searchHighlightCount; i++) {
+            int line = _searchHighlights[i * 3 + 0];
+            int col = _searchHighlights[i * 3 + 1];
+            int len = _searchHighlights[i * 3 + 2];
+            if (line < maxLine) {
+                CGFloat x = 10.0 + col * _charWidth;
+                CGFloat y = line * _lineHeight;
+                CGFloat w = len * _charWidth;
+                CGContextFillRect(context, NSMakeRect(x, y, w, _lineHeight));
+            }
         }
     }
 
@@ -365,6 +386,30 @@ void macos_window_set_selection(
             view.selStartCol = start_col;
             view.selEndLine = end_line;
             view.selEndCol = end_col;
+            [view setNeedsDisplay:YES];
+        }
+    }
+}
+
+void macos_window_set_search_highlights(
+    void *win_ptr,
+    bool active,
+    const int *line_col_len,
+    int count
+) {
+    if (!win_ptr) return;
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win_ptr;
+        if ([[window contentView] isKindOfClass:[EditorView class]]) {
+            EditorView *view = (EditorView *)[window contentView];
+            view.hasSearchHighlights = active;
+            view.searchHighlightCount = (count < 256) ? count : 256;
+            if (active && line_col_len && count > 0) {
+                int copyCount = view.searchHighlightCount * 3;
+                for (int i = 0; i < copyCount; i++) {
+                    view->_searchHighlights[i] = line_col_len[i];
+                }
+            }
             [view setNeedsDisplay:YES];
         }
     }
