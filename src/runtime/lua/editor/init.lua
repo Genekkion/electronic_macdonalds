@@ -33,6 +33,39 @@ require("editor.commands")
 require("editor.keymap")
 -- Load buffer management subsystem
 require("editor.buffers")
+-- Load events/autocommand subsystem
+require("editor.events")
+
+--- User-facing option setters and getters
+function editor.set(opt, val)
+    editor.set_option(opt, val)
+end
+
+function editor.get(opt)
+    return editor.get_option(opt)
+end
+
+--- User-facing command registration helper
+function editor.command(name, handler)
+    if type(handler) == "function" then
+        editor.create_command(name, handler)
+    elseif type(handler) == "string" then
+        editor.create_command(name, function(args)
+            local cmd = handler
+            if args and args ~= "" then
+                cmd = cmd .. " " .. args
+            end
+            editor.dispatch_command(cmd)
+        end)
+    else
+        error("command handler must be a function or string")
+    end
+end
+
+--- User-facing keymap helper
+function editor.map(mode, lhs, rhs, opts)
+    editor.keymap.set(mode, lhs, rhs, opts)
+end
 
 -- Default keymaps
 editor.keymap.set("n", "<leader>w", ":w<CR>")

@@ -23,6 +23,16 @@ pub const Mode = enum {
             .command_line => "-- COMMAND --",
         };
     }
+
+    pub fn to_str(self: Mode) []const u8 {
+        return switch (self) {
+            .normal => "normal",
+            .insert => "insert",
+            .visual => "visual",
+            .visual_line => "visual_line",
+            .command_line => "command_line",
+        };
+    }
 };
 
 const testing = std.testing;

@@ -19,6 +19,8 @@ const lua_editor_init = @embedFile("../runtime/lua/editor/init.lua");
 const lua_editor_commands = @embedFile("../runtime/lua/editor/commands.lua");
 const lua_editor_keymap = @embedFile("../runtime/lua/editor/keymap.lua");
 const lua_editor_buffers = @embedFile("../runtime/lua/editor/buffers.lua");
+const lua_editor_events = @embedFile("../runtime/lua/editor/events.lua");
+const events = @import("events.zig");
 
 pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
     global_registry = registry;
@@ -105,6 +107,9 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
 
     _ = c.luaL_loadbufferx(L, lua_editor_buffers.ptr, lua_editor_buffers.len, "@editor.buffers", null);
     c.lua_setfield(L, -2, "editor.buffers");
+
+    _ = c.luaL_loadbufferx(L, lua_editor_events.ptr, lua_editor_events.len, "@editor.events", null);
+    c.lua_setfield(L, -2, "editor.events");
 
     _ = c.luaL_loadbufferx(L, lua_editor_init.ptr, lua_editor_init.len, "@editor.init", null);
     c.lua_setfield(L, -2, "editor.init");
@@ -388,6 +393,11 @@ fn lua_set_current_buffer(L: ?*c.lua_State) callconv(.c) c_int {
         return result.push_error(L, "INVALID_ARGUMENT", "expected BufferHandle or buffer id number");
     }
     current_buffer_id = id;
+    if (global_registry) |reg| {
+        if (reg.get(id)) |buf| {
+            events.emit_event(L, .buf_enter, .{ .buf_id = id, .buf_path = buf.file_path });
+        }
+    }
     return result.push_success_bool(L, true);
 }
 
@@ -717,12 +727,17 @@ fn lua_save(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer registry.allocator.free(path_z);
 
+    const b_id: ?usize = if (get_handle_id(L, 1)) |hid| @intCast(hid) else null;
+    events.emit_event(L, .buf_write_pre, .{ .buf_id = b_id, .buf_path = path_slice });
+
     buf.save_to_file(path_z) catch |err| switch (err) {
         error.FileOpenFailed => return result.push_error(L, "FILE_OPEN_FAILED", "could not create or open file"),
         error.WriteFailed => return result.push_error(L, "WRITE_FAILED", "failed to write to file"),
         error.OutOfMemory => return result.push_error(L, "OUT_OF_MEMORY", "out of memory"),
         else => return result.push_error(L, "IO_ERROR", "failed to save file"),
     };
+
+    events.emit_event(L, .buf_write_post, .{ .buf_id = b_id, .buf_path = path_slice });
 
     return result.push_success_bool(L, true);
 }
@@ -1326,6 +1341,95 @@ test "test_lua_line_number_options" {
         \\editor.dispatch_command(":set nornu nonu")
         \\assert(editor.get_option("relativenumber") == false)
         \\assert(editor.get_option("number") == false)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_option_set_and_get" {
+    const script =
+        \\editor.set("number", false)
+        \\assert(editor.get("number") == false)
+        \\editor.set("relativenumber", true)
+        \\assert(editor.get("relativenumber") == true)
+        \\editor.set("scrolloff", 5)
+        \\assert(editor.get("scrolloff") == 5)
+        \\editor.set("tabstop", 4)
+        \\assert(editor.get("tabstop") == 4)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_custom_command_registration" {
+    const script =
+        \\local called = false
+        \\local passed_args = ""
+        \\editor.command("Format", function(args)
+        \\    called = true
+        \\    passed_args = args
+        \\end)
+        \\local ok = editor.dispatch_command(":Format code --dry-run")
+        \\assert(ok == true)
+        \\assert(called == true)
+        \\assert(passed_args == "code --dry-run")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_autocmd_buf_write_pre" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\editor.set_current_buffer(buf)
+        \\buf:insert(0, "content to write")
+        \\
+        \\local pre_called = false
+        \\local post_called = false
+        \\editor.on("BufWritePre", function(ev)
+        \\    pre_called = true
+        \\    assert(ev.buf_id == buf:get_id())
+        \\    assert(ev.buf_path == "/tmp/em_autocmd_test.txt")
+        \\end)
+        \\editor.on("BufWritePost", function(ev)
+        \\    post_called = true
+        \\    assert(ev.buf_id == buf:get_id())
+        \\    assert(ev.buf_path == "/tmp/em_autocmd_test.txt")
+        \\end)
+        \\
+        \\local ok, _, _ = buf:save("/tmp/em_autocmd_test.txt")
+        \\assert(ok == true)
+        \\assert(pre_called == true)
+        \\assert(post_called == true)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_autocmd_mode_changed" {
+    const script =
+        \\local mode_info = {}
+        \\editor.on("ModeChanged", function(ev)
+        \\    mode_info.from = ev.from
+        \\    mode_info.to = ev.to
+        \\end)
+        \\
+        \\editor.emit("ModeChanged", { from = "normal", to = "insert" })
+        \\assert(mode_info.from == "normal")
+        \\assert(mode_info.to == "insert")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_autocmd_error_isolation" {
+    const script =
+        \\local buf, _, _ = editor.create_buffer()
+        \\editor.set_current_buffer(buf)
+        \\buf:insert(0, "content")
+        \\
+        \\editor.on("BufWritePre", function(ev)
+        \\    error("intentional plugin error during save hook")
+        \\end)
+        \\
+        \\local ok, _, _ = buf:save("/tmp/em_err_isolate.txt")
+        \\assert(ok == true)
+        \\assert(editor.get_last_error():find("intentional plugin error") ~= nil)
     ;
     try run_lua_test(script);
 }

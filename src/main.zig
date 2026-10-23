@@ -376,7 +376,15 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
         @memcpy(cmd_copy[0..cmd_len], raw_cmd[0..cmd_len]);
     }
 
+    const prev_mode = g_editor.mode;
     g_editor.handle_key(buf, ev) catch {};
+
+    if (g_editor.mode != prev_mode and g_lua != null) {
+        root.events.emit_event(g_lua, .mode_changed, .{
+            .from_mode = prev_mode.to_str(),
+            .to_mode = g_editor.mode.to_str(),
+        });
+    }
 
     if ((was_colon_cmd or was_search_cmd) and ev.code == .enter) {
         saveHistory(std.heap.c_allocator);
@@ -479,6 +487,30 @@ pub fn main() !void {
     root.lua.init_binding(L, &registry);
     root.lua.set_active_buffer_id(buf_id);
     g_lua = L;
+
+    // Setup package.path for user config and plugins
+    const config_dir = root.config.get_config_dir(allocator) catch null;
+    defer if (config_dir) |cd| allocator.free(cd);
+    const plugins_dir = root.config.get_plugins_dir(allocator) catch null;
+    defer if (plugins_dir) |pd| allocator.free(pd);
+
+    if (config_dir) |cd| {
+        root.config.setup_package_path(L.?, allocator, cd, plugins_dir) catch {};
+    }
+
+    // Load user configuration (~/.config/electronic_macdonalds/init.lua)
+    if (root.config.get_config_path(allocator)) |cfg_path| {
+        defer allocator.free(cfg_path);
+        if (root.config.load_user_config(L.?, allocator, cfg_path)) |err_opt| {
+            if (err_opt) |err_msg| {
+                defer allocator.free(err_msg);
+                std.debug.print("Error loading config: {s}\n", .{err_msg});
+            }
+        } else |_| {}
+    } else |_| {}
+
+    // Auto-source installed plugin scripts (~/.local/share/electronic_macdonalds/plugins/*/plugin/*.lua)
+    root.config.load_plugin_scripts(L.?, allocator, plugins_dir);
 
     // 3. Initialize macOS Cocoa GUI
     if (!macos.macos_app_init()) return error.AppInitFailed;
