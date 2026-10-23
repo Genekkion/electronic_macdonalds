@@ -45,6 +45,21 @@ void macos_window_set_search_highlights(
     const int *line_col_len,
     int count
 );
+void macos_window_set_picker_overlay(
+    void *win,
+    bool active,
+    const char *title,
+    const char *prompt,
+    const char *items_joined,
+    int selected_idx,
+    int total_count,
+    const char *preview_text,
+    int preview_hl_line,
+    int preview_hl_col,
+    int preview_hl_len,
+    const int *item_hl_row_col,
+    int item_hl_count
+);
 void macos_clipboard_set(const char *text, int len);
 const char *macos_clipboard_get(int *out_len);
 void macos_window_redraw(void *win);

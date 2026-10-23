@@ -268,6 +268,192 @@ fn updateUi() void {
             }
         }
     }
+
+    updatePickerOverlay(win);
+}
+
+fn isLuaPickerOpen() bool {
+    const L = g_lua orelse return false;
+    _ = c.lua_getglobal(L, "editor");
+    if (!c.lua_istable(L, -1)) {
+        c.lua_pop(L, 1);
+        return false;
+    }
+    _ = c.lua_getfield(L, -1, "picker");
+    if (!c.lua_istable(L, -1)) {
+        c.lua_pop(L, 2);
+        return false;
+    }
+    _ = c.lua_getfield(L, -1, "is_open");
+    if (c.lua_pcallk(L, 0, 1, 0, 0, null) == 0) {
+        const res = c.lua_toboolean(L, -1) != 0;
+        c.lua_pop(L, 3);
+        return res;
+    }
+    c.lua_pop(L, 3);
+    return false;
+}
+
+fn feedKeyToLuaPicker(ev: KeyEvent, mods: c_int) bool {
+    const L = g_lua orelse return false;
+    if (!isLuaPickerOpen()) return false;
+
+    const key_name: [*c]const u8 = switch (ev.code) {
+        .escape => "escape",
+        .enter => "enter",
+        .backspace => "backspace",
+        .up => "up",
+        .down => "down",
+        .left => "left",
+        .right => "right",
+        .tab => "tab",
+        else => "char",
+    };
+
+    var char_buf: [2]u8 = .{ 0, 0 };
+    if (ev.code == .character and ev.char != null) {
+        char_buf[0] = ev.char.?;
+    }
+
+    _ = c.lua_getglobal(L, "editor");
+    _ = c.lua_getfield(L, -1, "picker");
+    _ = c.lua_getfield(L, -1, "handle_key");
+    _ = c.lua_pushstring(L, key_name);
+    _ = c.lua_pushlstring(L, &char_buf, if (char_buf[0] != 0) 1 else 0);
+    c.lua_pushinteger(L, mods);
+
+    if (c.lua_pcallk(L, 3, 1, 0, 0, null) == 0) {
+        const handled = c.lua_toboolean(L, -1) != 0;
+        c.lua_pop(L, 3);
+        return handled;
+    }
+    c.lua_pop(L, 3);
+    return false;
+}
+
+fn updatePickerOverlay(win: *anyopaque) void {
+    const L = g_lua orelse {
+        macos.macos_window_set_picker_overlay(win, false, null, null, null, 0, 0, null, -1, 0, 0, null, 0);
+        return;
+    };
+    if (!isLuaPickerOpen()) {
+        macos.macos_window_set_picker_overlay(win, false, null, null, null, 0, 0, null, -1, 0, 0, null, 0);
+        return;
+    }
+
+    _ = c.lua_getglobal(L, "editor");
+    _ = c.lua_getfield(L, -1, "picker");
+    _ = c.lua_getfield(L, -1, "get_ui_data");
+    if (c.lua_pcallk(L, 0, 1, 0, 0, null) != 0) {
+        c.lua_pop(L, 3);
+        macos.macos_window_set_picker_overlay(win, false, null, null, null, 0, 0, null, -1, 0, 0, null, 0);
+        return;
+    }
+    if (!c.lua_istable(L, -1)) {
+        c.lua_pop(L, 3);
+        macos.macos_window_set_picker_overlay(win, false, null, null, null, 0, 0, null, -1, 0, 0, null, 0);
+        return;
+    }
+
+    _ = c.lua_getfield(L, -1, "title");
+    const title_c = c.lua_tolstring(L, -1, null);
+
+    _ = c.lua_getfield(L, -2, "prompt");
+    const prompt_c = c.lua_tolstring(L, -1, null);
+
+    _ = c.lua_getfield(L, -3, "selected_index");
+    const sel_idx: c_int = @intCast(c.lua_tointegerx(L, -1, null));
+
+    _ = c.lua_getfield(L, -4, "total");
+    const total_cnt: c_int = @intCast(c.lua_tointegerx(L, -1, null));
+
+    _ = c.lua_getfield(L, -5, "preview");
+    const preview_c = c.lua_tolstring(L, -1, null);
+
+    var hl_line: c_int = -1;
+    var hl_col: c_int = 0;
+    var hl_len: c_int = 0;
+    _ = c.lua_getfield(L, -6, "preview_highlight");
+    if (c.lua_istable(L, -1)) {
+        _ = c.lua_getfield(L, -1, "line");
+        hl_line = @intCast(c.lua_tointegerx(L, -1, null));
+        _ = c.lua_getfield(L, -2, "col");
+        hl_col = @intCast(c.lua_tointegerx(L, -1, null));
+        _ = c.lua_getfield(L, -3, "len");
+        hl_len = @intCast(c.lua_tointegerx(L, -1, null));
+        c.lua_pop(L, 3);
+    }
+    c.lua_pop(L, 1);
+
+    var item_hl_pairs: [512 * 2]c_int = undefined;
+    var item_hl_count: usize = 0;
+    _ = c.lua_getfield(L, -6, "item_highlights");
+    if (c.lua_istable(L, -1)) {
+        var r_idx: c_longlong = 1;
+        while (true) : (r_idx += 1) {
+            _ = c.lua_rawgeti(L, -1, r_idx);
+            if (!c.lua_istable(L, -1)) {
+                c.lua_pop(L, 1);
+                break;
+            }
+            var c_idx: c_longlong = 1;
+            while (item_hl_count < 512) : (c_idx += 1) {
+                _ = c.lua_rawgeti(L, -1, c_idx);
+                if (c.lua_type(L, -1) != c.LUA_TNUMBER) {
+                    c.lua_pop(L, 1);
+                    break;
+                }
+                const col_val: c_int = @intCast(c.lua_tointegerx(L, -1, null));
+                item_hl_pairs[item_hl_count * 2 + 0] = @intCast(r_idx - 1);
+                item_hl_pairs[item_hl_count * 2 + 1] = col_val;
+                item_hl_count += 1;
+                c.lua_pop(L, 1);
+            }
+            c.lua_pop(L, 1);
+        }
+    }
+    c.lua_pop(L, 1);
+
+    _ = c.lua_getfield(L, -6, "items");
+    var joined_list: std.ArrayList(u8) = .empty;
+    defer joined_list.deinit(std.heap.c_allocator);
+
+    if (c.lua_istable(L, -1)) {
+        var idx: c_longlong = 1;
+        while (true) : (idx += 1) {
+            _ = c.lua_rawgeti(L, -1, idx);
+            if (c.lua_type(L, -1) != c.LUA_TSTRING) {
+                c.lua_pop(L, 1);
+                break;
+            }
+            var item_len: usize = 0;
+            const item_ptr = c.lua_tolstring(L, -1, &item_len);
+            if (item_ptr != null) {
+                if (idx > 1) joined_list.append(std.heap.c_allocator, '\n') catch {};
+                joined_list.appendSlice(std.heap.c_allocator, item_ptr[0..item_len]) catch {};
+            }
+            c.lua_pop(L, 1);
+        }
+    }
+    joined_list.append(std.heap.c_allocator, 0) catch {};
+
+    macos.macos_window_set_picker_overlay(
+        win,
+        true,
+        title_c,
+        prompt_c,
+        if (joined_list.items.len > 0) joined_list.items.ptr else "",
+        sel_idx,
+        total_cnt,
+        preview_c,
+        hl_line,
+        hl_col,
+        hl_len,
+        if (item_hl_count > 0) &item_hl_pairs else null,
+        @intCast(item_hl_count),
+    );
+
+    c.lua_pop(L, 9);
 }
 
 fn saveHistory(allocator: std.mem.Allocator) void {
@@ -375,6 +561,31 @@ fn onKeyDownCallback(ctx: ?*anyopaque, chars: [*c]const u8, key_code: c_int, mod
                 return;
             }
         },
+    }
+
+    if (isLuaPickerOpen()) {
+        root.lua.set_internal_cursor(g_editor.cursor.line, g_editor.cursor.col);
+        _ = feedKeyToLuaPicker(ev, mods);
+        if (root.lua.get_active_buffer_id()) |new_id| {
+            if (g_registry) |reg| {
+                if (reg.get(new_id)) |new_buf| {
+                    if (g_active_buffer != new_buf) {
+                        g_active_buffer = new_buf;
+                        g_editor.cursor = .{};
+                        updateFileWatch();
+                    }
+                }
+            }
+        }
+        const cur_info = root.lua.get_internal_cursor();
+        if (cur_info.updated) {
+            g_editor.cursor.line = cur_info.line;
+            g_editor.cursor.col = cur_info.col;
+            g_editor.cursor.desired_col = cur_info.col;
+        }
+        root.lua.set_internal_cursor(g_editor.cursor.line, g_editor.cursor.col);
+        updateUi();
+        return;
     }
 
     // Intercept keys via Lua Keymap Engine if not in command-line mode

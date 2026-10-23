@@ -56,6 +56,7 @@
 @interface EditorView : NSView {
 @public
     int _searchHighlights[256 * 3];
+    int _pickerItemHighlights[512 * 2];
 }
 @property (nonatomic, assign) void *ctx;
 @property (nonatomic, assign) GetLineCallback getLineCb;
@@ -77,6 +78,17 @@
 @property (nonatomic, assign) int selEndCol;
 @property (nonatomic, assign) BOOL hasSearchHighlights;
 @property (nonatomic, assign) int searchHighlightCount;
+@property (nonatomic, assign) BOOL hasPickerOverlay;
+@property (nonatomic, copy) NSString *pickerTitle;
+@property (nonatomic, copy) NSString *pickerPrompt;
+@property (nonatomic, copy) NSString *pickerItemsJoined;
+@property (nonatomic, assign) int pickerSelectedIdx;
+@property (nonatomic, assign) int pickerTotalCount;
+@property (nonatomic, copy) NSString *pickerPreviewText;
+@property (nonatomic, assign) int pickerPreviewHlLine;
+@property (nonatomic, assign) int pickerPreviewHlCol;
+@property (nonatomic, assign) int pickerPreviewHlLen;
+@property (nonatomic, assign) int pickerItemHlCount;
 @property (nonatomic, assign) BOOL cursorVisible;
 @property (nonatomic, strong) NSTimer *blinkTimer;
 @property (nonatomic, assign) CTFontRef font;
@@ -354,6 +366,119 @@
         NSAttributedString *attrStatus = [[NSAttributedString alloc] initWithString:_statusText attributes:statusAttrs];
         [attrStatus drawAtPoint:NSMakePoint(10.0, statusY + 3.0)];
     }
+
+    if (_hasPickerOverlay) {
+        CGFloat modalW = fmin(self.bounds.size.width * 0.88, 920.0);
+        CGFloat modalH = fmin(statusY * 0.82, 460.0);
+        CGFloat modalX = floor((self.bounds.size.width - modalW) * 0.5);
+        CGFloat modalY = floor((statusY - modalH) * 0.38);
+
+        CGContextSetRGBFillColor(context, 0.0, 0.0, 0.0, 0.48);
+        CGContextFillRect(context, NSMakeRect(0, 0, self.bounds.size.width, statusY));
+
+        NSRect modalRect = NSMakeRect(modalX, modalY, modalW, modalH);
+        CGContextSetRGBFillColor(context, 0.14, 0.15, 0.18, 0.98);
+        CGContextFillRect(context, modalRect);
+
+        CGContextSetRGBStrokeColor(context, 0.35, 0.52, 0.85, 0.90);
+        CGContextSetLineWidth(context, 1.5);
+        CGContextStrokeRect(context, modalRect);
+
+        CGFloat headerH = _lineHeight + 8.0;
+        CGFloat promptH = _lineHeight + 10.0;
+        CGContextSetRGBFillColor(context, 0.18, 0.21, 0.27, 1.0);
+        CGContextFillRect(context, NSMakeRect(modalX + 1, modalY + 1, modalW - 2, headerH));
+
+        NSColor *titleColor = [NSColor colorWithCalibratedRed:0.65 green:0.82 blue:1.0 alpha:1.0];
+        NSDictionary *titleAttrs = @{
+            NSFontAttributeName: (__bridge id)_font,
+            NSForegroundColorAttributeName: titleColor
+        };
+        NSString *hdrStr = [NSString stringWithFormat:@" %@ (%d) ", _pickerTitle ?: @"Picker", _pickerTotalCount];
+        [[[NSAttributedString alloc] initWithString:hdrStr attributes:titleAttrs]
+            drawAtPoint:NSMakePoint(modalX + 8.0, modalY + 4.0)];
+
+        CGFloat promptY = modalY + headerH;
+        CGContextSetRGBFillColor(context, 0.11, 0.12, 0.15, 1.0);
+        CGContextFillRect(context, NSMakeRect(modalX + 1, promptY, modalW - 2, promptH));
+
+        NSColor *promptColor = [NSColor colorWithCalibratedRed:0.95 green:0.85 blue:0.45 alpha:1.0];
+        NSDictionary *promptAttrs = @{
+            NSFontAttributeName: (__bridge id)_font,
+            NSForegroundColorAttributeName: promptColor
+        };
+        NSString *pStr = _pickerPrompt ?: @"> ";
+        CGContextSaveGState(context);
+        CGContextClipToRect(context, NSMakeRect(modalX + 2.0, promptY, modalW - 4.0, promptH));
+        [[[NSAttributedString alloc] initWithString:pStr attributes:promptAttrs]
+            drawAtPoint:NSMakePoint(modalX + 10.0, promptY + 5.0)];
+        CGContextRestoreGState(context);
+
+        CGFloat bodyY = promptY + promptH;
+        CGFloat bodyH = modalH - headerH - promptH - 2.0;
+        CGFloat leftW = floor(modalW * 0.45);
+        CGFloat rightX = modalX + leftW + 1.0;
+        CGFloat rightW = modalW - leftW - 3.0;
+
+        CGContextSetRGBStrokeColor(context, 0.25, 0.28, 0.35, 1.0);
+        CGPoint divPts[2] = { CGPointMake(modalX + leftW, bodyY), CGPointMake(modalX + leftW, modalY + modalH - 1.0) };
+        CGContextStrokeLineSegments(context, divPts, 2);
+
+        if (_pickerItemsJoined && _pickerItemsJoined.length > 0) {
+            CGContextSaveGState(context);
+            CGContextClipToRect(context, NSMakeRect(modalX + 2.0, bodyY, leftW - 4.0, bodyH));
+            NSArray<NSString *> *items = [_pickerItemsJoined componentsSeparatedByString:@"\n"];
+            int maxRows = (int)floor(bodyH / _lineHeight);
+            NSColor *matchCharColor = [NSColor colorWithCalibratedRed:1.0 green:0.86 blue:0.35 alpha:1.0];
+            for (int r = 0; r < (int)items.count && r < maxRows; r++) {
+                CGFloat rowY = bodyY + r * _lineHeight;
+                BOOL isSel = ((r + 1) == _pickerSelectedIdx);
+                if (isSel) {
+                    CGContextSetRGBFillColor(context, 0.24, 0.38, 0.62, 0.85);
+                    CGContextFillRect(context, NSMakeRect(modalX + 2.0, rowY, leftW - 3.0, _lineHeight));
+                }
+                NSString *itemText = items[r];
+                NSMutableAttributedString *attrItem = [[NSMutableAttributedString alloc] initWithString:itemText attributes:attributes];
+                if (_pickerItemHlCount > 0) {
+                    CGContextSetRGBFillColor(context, 0.95, 0.75, 0.15, 0.35);
+                    for (int h = 0; h < _pickerItemHlCount; h++) {
+                        int hlRow = _pickerItemHighlights[h * 2 + 0];
+                        int hlCol = _pickerItemHighlights[h * 2 + 1];
+                        if (hlRow == r && hlCol >= 0) {
+                            CGFloat hlX = modalX + 10.0 + hlCol * _charWidth;
+                            CGContextFillRect(context, NSMakeRect(hlX, rowY, _charWidth, _lineHeight));
+                            if ((NSUInteger)hlCol < attrItem.length) {
+                                [attrItem addAttribute:NSForegroundColorAttributeName
+                                                 value:matchCharColor
+                                                 range:NSMakeRange((NSUInteger)hlCol, 1)];
+                            }
+                        }
+                    }
+                }
+                [attrItem drawAtPoint:NSMakePoint(modalX + 10.0, rowY)];
+            }
+            CGContextRestoreGState(context);
+        }
+
+        if (_pickerPreviewText && _pickerPreviewText.length > 0) {
+            CGContextSaveGState(context);
+            CGContextClipToRect(context, NSMakeRect(rightX, bodyY, rightW - 4.0, bodyH));
+            NSArray<NSString *> *pLines = [_pickerPreviewText componentsSeparatedByString:@"\n"];
+            int maxRows = (int)floor(bodyH / _lineHeight);
+            for (int r = 0; r < (int)pLines.count && r < maxRows; r++) {
+                CGFloat rowY = bodyY + r * _lineHeight;
+                if (r == _pickerPreviewHlLine && _pickerPreviewHlLen > 0) {
+                    CGFloat hlX = rightX + 8.0 + _pickerPreviewHlCol * _charWidth;
+                    CGFloat hlW = _pickerPreviewHlLen * _charWidth;
+                    CGContextSetRGBFillColor(context, 0.95, 0.75, 0.15, 0.40);
+                    CGContextFillRect(context, NSMakeRect(hlX, rowY, hlW, _lineHeight));
+                }
+                [[[NSAttributedString alloc] initWithString:pLines[r] attributes:attributes]
+                    drawAtPoint:NSMakePoint(rightX + 8.0, rowY)];
+            }
+            CGContextRestoreGState(context);
+        }
+    }
 }
 
 @end
@@ -621,6 +746,50 @@ void macos_window_set_search_highlights(
                 for (int i = 0; i < copyCount; i++) {
                     view->_searchHighlights[i] = line_col_len[i];
                 }
+            }
+            [view setNeedsDisplay:YES];
+        }
+    }
+}
+
+void macos_window_set_picker_overlay(
+    void *win_ptr,
+    bool active,
+    const char *title,
+    const char *prompt,
+    const char *items_joined,
+    int selected_idx,
+    int total_count,
+    const char *preview_text,
+    int preview_hl_line,
+    int preview_hl_col,
+    int preview_hl_len,
+    const int *item_hl_row_col,
+    int item_hl_count
+) {
+    if (!win_ptr) return;
+    @autoreleasepool {
+        NSWindow *window = (__bridge NSWindow *)win_ptr;
+        if ([[window contentView] isKindOfClass:[EditorView class]]) {
+            EditorView *view = (EditorView *)[window contentView];
+            view.hasPickerOverlay = active;
+            if (active) {
+                view.pickerTitle = title ? [NSString stringWithUTF8String:title] : @"Picker";
+                view.pickerPrompt = prompt ? [NSString stringWithUTF8String:prompt] : @"> ";
+                view.pickerItemsJoined = items_joined ? [NSString stringWithUTF8String:items_joined] : @"";
+                view.pickerSelectedIdx = selected_idx;
+                view.pickerTotalCount = total_count;
+                view.pickerPreviewText = preview_text ? [NSString stringWithUTF8String:preview_text] : @"";
+                view.pickerPreviewHlLine = preview_hl_line;
+                view.pickerPreviewHlCol = preview_hl_col;
+                view.pickerPreviewHlLen = preview_hl_len;
+                int clampedCount = (item_hl_count < 512) ? item_hl_count : 512;
+                view.pickerItemHlCount = (clampedCount > 0 && item_hl_row_col) ? clampedCount : 0;
+                for (int i = 0; i < view.pickerItemHlCount * 2; i++) {
+                    view->_pickerItemHighlights[i] = item_hl_row_col[i];
+                }
+            } else {
+                view.pickerItemHlCount = 0;
             }
             [view setNeedsDisplay:YES];
         }

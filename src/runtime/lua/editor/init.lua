@@ -39,6 +39,8 @@ require("editor.buffers")
 require("editor.events")
 -- Load oil filesystem buffer subsystem
 require("editor.oil")
+-- Load unified picker subsystem
+require("editor.picker")
 
 --- User-facing option setters and getters
 function editor.set(opt, val)
@@ -76,6 +78,18 @@ editor.keymap.set("n", "<leader>w", ":w<CR>")
 editor.keymap.set("n", "<leader>q", ":q<CR>")
 editor.keymap.set("n", "<leader>bn", ":bn<CR>")
 editor.keymap.set("n", "<leader>bp", ":bp<CR>")
+editor.keymap.set("n", "<leader>sf", function()
+    Snacks.picker.files({
+        hidden = true,
+        ignored = false,
+    })
+end)
+editor.keymap.set("n", "<leader>sg", function()
+    Snacks.picker.grep()
+end)
+editor.keymap.set("n", "<leader>ps", function()
+    Snacks.picker.lines()
+end)
 
 -- Oil filesystem buffer keymaps
 editor.keymap.set("n", "-", function()

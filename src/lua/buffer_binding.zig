@@ -21,8 +21,10 @@ const lua_editor_keymap = @embedFile("../runtime/lua/editor/keymap.lua");
 const lua_editor_buffers = @embedFile("../runtime/lua/editor/buffers.lua");
 const lua_editor_events = @embedFile("../runtime/lua/editor/events.lua");
 const lua_editor_oil = @embedFile("../runtime/lua/editor/oil.lua");
+const lua_editor_picker = @embedFile("../runtime/lua/editor/picker.lua");
 const events = @import("events.zig");
 const fs = @import("fs.zig");
+const search_binding = @import("search_binding.zig");
 
 pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
     global_registry = registry;
@@ -103,6 +105,8 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
         .{ .name = "fs_delete", .func = fs.lua_fs_delete },
         .{ .name = "fs_mkdir", .func = fs.lua_fs_mkdir },
         .{ .name = "fs_touch", .func = fs.lua_fs_touch },
+        .{ .name = "find_files", .func = search_binding.lua_find_files },
+        .{ .name = "live_grep", .func = search_binding.lua_live_grep },
         .{ .name = null, .func = null },
     };
     c.luaL_setfuncs(L, &editor_funcs, 0);
@@ -126,6 +130,9 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
 
     _ = c.luaL_loadbufferx(L, lua_editor_oil.ptr, lua_editor_oil.len, "@editor.oil", null);
     c.lua_setfield(L, -2, "editor.oil");
+
+    _ = c.luaL_loadbufferx(L, lua_editor_picker.ptr, lua_editor_picker.len, "@editor.picker", null);
+    c.lua_setfield(L, -2, "editor.picker");
 
     _ = c.luaL_loadbufferx(L, lua_editor_init.ptr, lua_editor_init.len, "@editor.init", null);
     c.lua_setfield(L, -2, "editor.init");
@@ -1970,3 +1977,271 @@ test "test_lua_reload_test_plan_md" {
     ;
     try run_lua_test(script);
 }
+
+test "test_lua_picker_custom_source_lifecycle_and_navigation" {
+    const script =
+        \\local selected_item = nil
+        \\editor.picker.open({
+        \\    title = "Custom Picker",
+        \\    items = {
+        \\        { text = "apple", id = 1 },
+        \\        { text = "banana", id = 2 },
+        \\        { text = "apricot", id = 3 },
+        \\    },
+        \\    on_select = function(item)
+        \\        selected_item = item
+        \\    end,
+        \\})
+        \\assert(editor.picker.is_open() == true)
+        \\editor.picker.set_query("ap")
+        \\local state = editor.picker.get_state()
+        \\assert(state ~= nil)
+        \\assert(#state.filtered == 2)
+        \\assert(state.selected == 1)
+        \\editor.picker.move_selection(1)
+        \\state = editor.picker.get_state()
+        \\assert(state.selected == 2)
+        \\editor.picker.confirm()
+        \\assert(editor.picker.is_open() == false)
+        \\assert(selected_item ~= nil)
+        \\assert(selected_item.text == "apricot")
+        \\assert(selected_item.id == 3)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_snacks_picker_files_opens_selected_file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "target.lua", .data = "return 42\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.txt", .data = "hello\n" });
+
+    var script_buf: [1024]u8 = undefined;
+    const script = try std.fmt.bufPrintZ(&script_buf,
+        \\Snacks.picker.files({{
+        \\    cwd = ".zig-cache/tmp/{s}",
+        \\    hidden = true,
+        \\    ignored = false,
+        \\}})
+        \\assert(editor.picker.is_open() == true)
+        \\editor.picker.set_query("target.lua")
+        \\local state = editor.picker.get_state()
+        \\assert(#state.filtered == 1)
+        \\editor.picker.confirm()
+        \\assert(editor.picker.is_open() == false)
+        \\local cur = editor.get_current_buffer()
+        \\assert(cur:get_path():find("target.lua") ~= nil)
+        \\assert(cur:get_slice(0, cur:len()) == "return 42\n")
+    , .{&tmp.sub_path});
+    try run_lua_test(script);
+}
+
+test "test_lua_snacks_picker_grep_jumps_to_line_and_col" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "code.zig",
+        .data = "const a = 1;\nconst b = 2;\n    const magic_val = 42;\n",
+    });
+
+    var script_buf: [1024]u8 = undefined;
+    const script = try std.fmt.bufPrintZ(&script_buf,
+        \\Snacks.picker.grep({{
+        \\    cwd = ".zig-cache/tmp/{s}",
+        \\}})
+        \\assert(editor.picker.is_open() == true)
+        \\editor.picker.set_query("magic_val")
+        \\local state = editor.picker.get_state()
+        \\assert(#state.filtered == 1)
+        \\editor.picker.confirm()
+        \\assert(editor.picker.is_open() == false)
+        \\local cur = editor.get_current_buffer()
+        \\assert(cur:get_path():find("code.zig") ~= nil)
+        \\local line, col = editor.get_cursor()
+        \\assert(line == 2, "expected line 2, got " .. tostring(line))
+        \\assert(col == 10, "expected col 10, got " .. tostring(col))
+    , .{&tmp.sub_path});
+    try run_lua_test(script);
+}
+
+test "test_lua_snacks_picker_lines_and_default_keymaps" {
+    const script =
+        \\local cur = editor.create_buffer()
+        \\editor.set_current_buffer(cur)
+        \\cur:insert(0, "alpha line\nbeta line\ngamma target\ndelta line\n")
+        \\editor.set_cursor(0, 0)
+        \\local st1 = editor.keymap.feed("n", " ")
+        \\assert(st1 == "pending")
+        \\local st2 = editor.keymap.feed("n", "p")
+        \\assert(st2 == "pending")
+        \\local st3 = editor.keymap.feed("n", "s")
+        \\assert(st3 == "matched")
+        \\assert(editor.picker.is_open() == true)
+        \\editor.picker.set_query("gamma")
+        \\editor.picker.confirm()
+        \\assert(editor.picker.is_open() == false)
+        \\local line, _ = editor.get_cursor()
+        \\assert(line == 2, "expected line 2, got " .. tostring(line))
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_picker_ui_data_fills_viewport_rows_and_preview" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    var file_data: std.ArrayList(u8) = .empty;
+    defer file_data.deinit(std.testing.allocator);
+    var line_i: usize = 1;
+    while (line_i <= 40) : (line_i += 1) {
+        const l = try std.fmt.allocPrint(std.testing.allocator, "preview line {d}\n", .{line_i});
+        defer std.testing.allocator.free(l);
+        try file_data.appendSlice(std.testing.allocator, l);
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "long_file.txt", .data = file_data.items });
+
+    var script_buf: [1536]u8 = undefined;
+    const script = try std.fmt.bufPrintZ(&script_buf,
+        \\local items = {{}}
+        \\for i = 1, 40 do
+        \\    table.insert(items, {{
+        \\        text = string.format("item_%02d", i),
+        \\        full_path = ".zig-cache/tmp/{s}/long_file.txt",
+        \\    }})
+        \\end
+        \\editor.picker.open({{
+        \\    title = "Viewport Test",
+        \\    items = items,
+        \\}})
+        \\local ui = editor.picker.get_ui_data(23)
+        \\assert(#ui.items == 23, "expected 23 items, got " .. tostring(#ui.items))
+        \\local p_count = 0
+        \\for _ in ui.preview:gmatch("[^\n]+") do p_count = p_count + 1 end
+        \\assert(p_count == 23, "expected 23 preview lines, got " .. tostring(p_count))
+        \\for _ = 1, 24 do editor.picker.move_selection(1) end
+        \\ui = editor.picker.get_ui_data(23)
+        \\assert(ui.selected_index == 19, "expected selected_index 19, got " .. tostring(ui.selected_index))
+        \\assert(ui.items[19] == "item_25", "expected item_25, got " .. tostring(ui.items[19]))
+        \\editor.picker.close()
+    , .{&tmp.sub_path});
+    try run_lua_test(script);
+}
+
+test "test_lua_picker_viewport_scroll_with_padding_and_upward_movement" {
+    const script =
+        \\local items = {}
+        \\for i = 1, 40 do
+        \\    table.insert(items, { text = string.format("item_%02d", i) })
+        \\end
+        \\editor.picker.open({
+        \\    title = "Scroll Padding Test",
+        \\    items = items,
+        \\})
+        \\for _ = 1, 24 do editor.picker.move_selection(1) end
+        \\local ui = editor.picker.get_ui_data(23)
+        \\assert(ui.selected_index == 19, "expected selected_index 19 with scrolloff=4, got " .. tostring(ui.selected_index))
+        \\assert(ui.items[19] == "item_25", "expected item_25 at row 19, got " .. tostring(ui.items[19]))
+        \\for _ = 1, 5 do editor.picker.move_selection(-1) end
+        \\ui = editor.picker.get_ui_data(23)
+        \\assert(ui.selected_index == 14, "expected selected_index 14 after moving up 5, got " .. tostring(ui.selected_index))
+        \\assert(ui.items[14] == "item_20", "expected item_20 at row 14, got " .. tostring(ui.items[14]))
+        \\for _ = 1, 20 do editor.picker.move_selection(1) end
+        \\ui = editor.picker.get_ui_data(23)
+        \\assert(ui.selected_index == 23, "expected selected_index 23 at last item, got " .. tostring(ui.selected_index))
+        \\assert(ui.items[23] == "item_40", "expected item_40 at row 23, got " .. tostring(ui.items[23]))
+        \\editor.picker.close()
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_picker_grep_preview_highlight_span" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "sample.zig",
+        .data = "const a = 1;\nconst b = 2;\n    const magic_val = 42;\nconst c = 3;\n",
+    });
+
+    var script_buf: [1536]u8 = undefined;
+    const script = try std.fmt.bufPrintZ(&script_buf,
+        \\Snacks.picker.grep({{ cwd = ".zig-cache/tmp/{s}" }})
+        \\editor.picker.set_query("magic_val")
+        \\local ui = editor.picker.get_ui_data(23)
+        \\assert(ui.preview_highlight ~= nil, "expected preview_highlight table")
+        \\assert(ui.preview_highlight.line == 2, "expected highlight line 2 (0-indexed), got " .. tostring(ui.preview_highlight.line))
+        \\assert(ui.preview_highlight.col == 20, "expected highlight col 20 (0-indexed), got " .. tostring(ui.preview_highlight.col))
+        \\assert(ui.preview_highlight.len == 9, "expected highlight len 9, got " .. tostring(ui.preview_highlight.len))
+        \\local preview_lines = {{}}
+        \\for l in ui.preview:gmatch("[^\n]+") do table.insert(preview_lines, l) end
+        \\local target_line = preview_lines[ui.preview_highlight.line + 1]
+        \\local sub = target_line:sub(ui.preview_highlight.col + 1, ui.preview_highlight.col + ui.preview_highlight.len)
+        \\assert(sub == "magic_val", "expected highlighted substring 'magic_val', got '" .. tostring(sub) .. "'")
+        \\editor.picker.close()
+    , .{&tmp.sub_path});
+    try run_lua_test(script);
+}
+
+test "test_lua_picker_snacks_matcher_scoring_and_modifiers" {
+    const script =
+        \\editor.picker.open({
+        \\    title = "Snacks Matcher Test",
+        \\    items = {
+        \\        { text = "src/deep/p_i_c_k_e_r.lua", file = "src/deep/p_i_c_k_e_r.lua" },
+        \\        { text = "src/editor/picker.lua", file = "src/editor/picker.lua" },
+        \\        { text = "test/picker_test.lua", file = "test/picker_test.lua" },
+        \\    },
+        \\})
+        \\editor.picker.set_query("picker")
+        \\local ui = editor.picker.get_ui_data(23)
+        \\assert(#ui.items == 3, "expected 3 matched items, got " .. tostring(#ui.items))
+        \\assert(ui.items[1] == "src/editor/picker.lua", "expected src/editor/picker.lua ranked #1, got " .. tostring(ui.items[1]))
+        \\
+        \\editor.picker.set_query("picker !test")
+        \\ui = editor.picker.get_ui_data(23)
+        \\assert(#ui.items == 2, "expected 2 items after !test, got " .. tostring(#ui.items))
+        \\for _, it in ipairs(ui.items) do
+        \\    assert(not it:find("test", 1, true), "unexpected test item: " .. it)
+        \\end
+        \\
+        \\editor.picker.set_query("^src/editor")
+        \\ui = editor.picker.get_ui_data(23)
+        \\assert(#ui.items == 1 and ui.items[1] == "src/editor/picker.lua", "expected exact prefix match")
+        \\
+        \\editor.picker.set_query("test.lua$")
+        \\ui = editor.picker.get_ui_data(23)
+        \\assert(#ui.items == 1 and ui.items[1] == "test/picker_test.lua", "expected exact suffix match")
+        \\editor.picker.close()
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_picker_left_list_matched_char_highlights" {
+    const script =
+        \\editor.picker.open({
+        \\    title = "Left Highlights Test",
+        \\    items = {
+        \\        { text = "src/editor/picker.lua", file = "src/editor/picker.lua" },
+        \\    },
+        \\})
+        \\editor.picker.set_query("pkr")
+        \\local ui = editor.picker.get_ui_data(23)
+        \\assert(ui.item_highlights ~= nil, "expected item_highlights table")
+        \\local cols = ui.item_highlights[1]
+        \\assert(cols ~= nil and #cols == 3, "expected 3 highlighted char cols for row 1")
+        \\assert(cols[1] == 11 and cols[2] == 14 and cols[3] == 16,
+        \\    string.format("expected {11, 14, 16}, got {%s, %s, %s}", tostring(cols[1]), tostring(cols[2]), tostring(cols[3])))
+        \\editor.picker.close()
+    ;
+    try run_lua_test(script);
+}
+
+
+
+

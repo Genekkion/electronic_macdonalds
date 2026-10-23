@@ -10,8 +10,11 @@ pub const undo = @import("buffer/undo.zig");
 pub const undo_persist = @import("buffer/undo_persist.zig");
 pub const search = @import("buffer/search.zig");
 pub const patience = @import("buffer/patience.zig");
+pub const ignore = @import("search/ignore.zig");
+pub const search_engine = @import("search/engine.zig");
 
 pub const lua = @import("lua/buffer_binding.zig");
+pub const search_binding = @import("lua/search_binding.zig");
 pub const config = @import("lua/config.zig");
 pub const events = @import("lua/events.zig");
 pub const fs = @import("lua/fs.zig");
@@ -47,4 +50,7 @@ test {
     _ = @import("lua/config.zig");
     _ = @import("lua/events.zig");
     _ = @import("lua/fs.zig");
+    _ = @import("lua/search_binding.zig");
+    _ = @import("search/ignore.zig");
+    _ = @import("search/engine.zig");
 }
