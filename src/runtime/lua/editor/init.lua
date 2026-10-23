@@ -35,6 +35,8 @@ require("editor.keymap")
 require("editor.buffers")
 -- Load events/autocommand subsystem
 require("editor.events")
+-- Load oil filesystem buffer subsystem
+require("editor.oil")
 
 --- User-facing option setters and getters
 function editor.set(opt, val)
@@ -72,5 +74,20 @@ editor.keymap.set("n", "<leader>w", ":w<CR>")
 editor.keymap.set("n", "<leader>q", ":q<CR>")
 editor.keymap.set("n", "<leader>bn", ":bn<CR>")
 editor.keymap.set("n", "<leader>bp", ":bp<CR>")
+
+-- Oil filesystem buffer keymaps
+editor.keymap.set("n", "-", function()
+    if editor.oil and editor.oil.is_oil_buffer(editor.get_current_buffer()) then
+        editor.oil.parent_dir()
+    else
+        editor.oil.open(".")
+    end
+end)
+
+editor.keymap.set("n", "<CR>", function()
+    if editor.oil and editor.oil.is_oil_buffer(editor.get_current_buffer()) then
+        editor.oil.select_entry()
+    end
+end)
 
 return editor

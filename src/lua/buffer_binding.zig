@@ -20,7 +20,9 @@ const lua_editor_commands = @embedFile("../runtime/lua/editor/commands.lua");
 const lua_editor_keymap = @embedFile("../runtime/lua/editor/keymap.lua");
 const lua_editor_buffers = @embedFile("../runtime/lua/editor/buffers.lua");
 const lua_editor_events = @embedFile("../runtime/lua/editor/events.lua");
+const lua_editor_oil = @embedFile("../runtime/lua/editor/oil.lua");
 const events = @import("events.zig");
+const fs = @import("fs.zig");
 
 pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
     global_registry = registry;
@@ -42,6 +44,7 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
         .{ .name = "get_id", .func = lua_get_id },
         .{ .name = "get_name", .func = lua_get_name },
         .{ .name = "get_path", .func = lua_get_path },
+        .{ .name = "set_path", .func = lua_set_path },
         .{ .name = "replace", .func = lua_replace },
         .{ .name = "undo", .func = lua_buf_undo },
         .{ .name = "redo", .func = lua_buf_redo },
@@ -90,6 +93,12 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
         .{ .name = "set_cursor", .func = lua_set_cursor },
         .{ .name = "bind_key", .func = lua_bind_key },
         .{ .name = "dispatch_key_combo", .func = lua_dispatch_key_combo },
+        .{ .name = "is_dir", .func = fs.lua_is_dir },
+        .{ .name = "read_dir", .func = fs.lua_read_dir },
+        .{ .name = "fs_rename", .func = fs.lua_fs_rename },
+        .{ .name = "fs_delete", .func = fs.lua_fs_delete },
+        .{ .name = "fs_mkdir", .func = fs.lua_fs_mkdir },
+        .{ .name = "fs_touch", .func = fs.lua_fs_touch },
         .{ .name = null, .func = null },
     };
     c.luaL_setfuncs(L, &editor_funcs, 0);
@@ -110,6 +119,9 @@ pub fn init_binding(L: ?*c.lua_State, registry: *BufferRegistry) void {
 
     _ = c.luaL_loadbufferx(L, lua_editor_events.ptr, lua_editor_events.len, "@editor.events", null);
     c.lua_setfield(L, -2, "editor.events");
+
+    _ = c.luaL_loadbufferx(L, lua_editor_oil.ptr, lua_editor_oil.len, "@editor.oil", null);
+    c.lua_setfield(L, -2, "editor.oil");
 
     _ = c.luaL_loadbufferx(L, lua_editor_init.ptr, lua_editor_init.len, "@editor.init", null);
     c.lua_setfield(L, -2, "editor.init");
@@ -480,6 +492,24 @@ fn lua_get_path(L: ?*c.lua_State) callconv(.c) c_int {
     }
     c.lua_pushnil(L);
     return 1;
+}
+
+fn lua_set_path(L: ?*c.lua_State) callconv(.c) c_int {
+    const res = resolve_buffer(L, 1);
+    const buf = switch (res) {
+        .err_ret => |code| return code,
+        .buf => |b| b,
+    };
+    var len: usize = 0;
+    const path_c = c.lua_tolstring(L, 2, &len);
+    if (path_c == null) {
+        return result.push_error(L, "INVALID_ARGUMENT", "expected path string");
+    }
+    const path_slice = path_c[0..len];
+    buf.set_file_path(path_slice) catch {
+        return result.push_error(L, "OUT_OF_MEMORY", "failed to allocate path");
+    };
+    return result.push_success_bool(L, true);
 }
 
 fn lua_get_name(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1430,6 +1460,219 @@ test "test_lua_autocmd_error_isolation" {
         \\local ok, _, _ = buf:save("/tmp/em_err_isolate.txt")
         \\assert(ok == true)
         \\assert(editor.get_last_error():find("intentional plugin error") ~= nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_fs_primitives" {
+    const script =
+        \\-- Ensure test directory clean
+        \\pcall(function() editor.fs_delete("/tmp/em_fs_test_dir/file2.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_fs_test_dir/file1.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_fs_test_dir", true) end)
+        \\
+        \\local ok, _, _ = editor.fs_mkdir("/tmp/em_fs_test_dir")
+        \\assert(ok == true)
+        \\assert(editor.is_dir("/tmp/em_fs_test_dir") == true)
+        \\
+        \\local ok2, _, _ = editor.fs_touch("/tmp/em_fs_test_dir/file1.txt")
+        \\assert(ok2 == true)
+        \\assert(editor.is_dir("/tmp/em_fs_test_dir/file1.txt") == false)
+        \\
+        \\local entries = editor.read_dir("/tmp/em_fs_test_dir")
+        \\assert(#entries == 1)
+        \\assert(entries[1].name == "file1.txt")
+        \\assert(entries[1].is_dir == false)
+        \\
+        \\local ok3, _, _ = editor.fs_rename("/tmp/em_fs_test_dir/file1.txt", "/tmp/em_fs_test_dir/file2.txt")
+        \\assert(ok3 == true)
+        \\local entries2 = editor.read_dir("/tmp/em_fs_test_dir")
+        \\assert(#entries2 == 1)
+        \\assert(entries2[1].name == "file2.txt")
+        \\
+        \\local ok4, _, _ = editor.fs_delete("/tmp/em_fs_test_dir/file2.txt", false)
+        \\assert(ok4 == true)
+        \\local entries3 = editor.read_dir("/tmp/em_fs_test_dir")
+        \\assert(#entries3 == 0)
+        \\
+        \\local ok5, _, _ = editor.fs_delete("/tmp/em_fs_test_dir", true)
+        \\assert(ok5 == true)
+        \\assert(editor.is_dir("/tmp/em_fs_test_dir") == false)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_edit_existing_file" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_edit_test.txt", false) end)
+        \\editor.fs_touch("/tmp/em_edit_test.txt")
+        \\local buf, _, _ = editor.create_buffer()
+        \\buf:insert(0, "saved file content")
+        \\buf:save("/tmp/em_edit_test.txt")
+        \\
+        \\editor.dispatch_command(":e /tmp/em_edit_test.txt")
+        \\local cur = editor.get_current_buffer()
+        \\assert(cur ~= nil)
+        \\assert(cur:get_path() == "/tmp/em_edit_test.txt")
+        \\local s, _, _ = cur:get_slice(0, cur:len())
+        \\assert(s == "saved file content")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_edit_already_open_file" {
+    const script =
+        \\editor.fs_touch("/tmp/em_edit_test.txt")
+        \\local b1, _, _ = editor.read_file("/tmp/em_edit_test.txt")
+        \\local b1_id = b1:get_id()
+        \\local b2, _, _ = editor.create_buffer()
+        \\editor.set_current_buffer(b2)
+        \\assert(editor.get_current_buffer():get_id() == b2:get_id())
+        \\
+        \\editor.dispatch_command(":e /tmp/em_edit_test.txt")
+        \\assert(editor.get_current_buffer():get_id() == b1_id)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_edit_new_file" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_nonexistent.txt", false) end)
+        \\editor.dispatch_command(":e /tmp/em_nonexistent.txt")
+        \\local cur = editor.get_current_buffer()
+        \\assert(cur ~= nil)
+        \\assert(cur:get_path() == "/tmp/em_nonexistent.txt")
+        \\assert(cur:len() == 0)
+        \\cur:insert(0, "new content")
+        \\editor.dispatch_command(":w")
+        \\assert(editor.read_file("/tmp/em_nonexistent.txt") ~= nil)
+        \\pcall(function() editor.fs_delete("/tmp/em_nonexistent.txt", false) end)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_oil_open_directory" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/sub", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/b.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/a.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test", true) end)
+        \\
+        \\editor.fs_mkdir("/tmp/em_oil_test")
+        \\editor.fs_mkdir("/tmp/em_oil_test/sub")
+        \\editor.fs_touch("/tmp/em_oil_test/b.txt")
+        \\editor.fs_touch("/tmp/em_oil_test/a.txt")
+        \\
+        \\editor.dispatch_command(":e /tmp/em_oil_test")
+        \\local cur = editor.get_current_buffer()
+        \\assert(editor.oil.is_oil_buffer(cur) == true)
+        \\local s, _, _ = cur:get_slice(0, cur:len())
+        \\assert(s == "sub/\na.txt\nb.txt\n")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_oil_navigation" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/sub", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/b.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/a.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test", true) end)
+        \\editor.fs_mkdir("/tmp/em_oil_test")
+        \\editor.fs_mkdir("/tmp/em_oil_test/sub")
+        \\editor.fs_touch("/tmp/em_oil_test/b.txt")
+        \\editor.fs_touch("/tmp/em_oil_test/a.txt")
+        \\
+        \\editor.dispatch_command(":e /tmp/em_oil_test")
+        \\editor.set_cursor(0, 0)
+        \\editor.oil.select_entry()
+        \\local cur = editor.get_current_buffer()
+        \\assert(cur:get_path() == "/tmp/em_oil_test/sub/")
+        \\
+        \\editor.oil.parent_dir()
+        \\local cur2 = editor.get_current_buffer()
+        \\assert(cur2:get_path() == "/tmp/em_oil_test/")
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_oil_save_rename" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/sub", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/b.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/a.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/alpha.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test", true) end)
+        \\editor.fs_mkdir("/tmp/em_oil_test")
+        \\editor.fs_mkdir("/tmp/em_oil_test/sub")
+        \\editor.fs_touch("/tmp/em_oil_test/b.txt")
+        \\editor.fs_touch("/tmp/em_oil_test/a.txt")
+        \\
+        \\editor.dispatch_command(":e /tmp/em_oil_test")
+        \\local cur = editor.get_current_buffer()
+        \\cur:delete(0, cur:len())
+        \\cur:insert(0, "sub/\nalpha.txt\nb.txt\n")
+        \\
+        \\editor.dispatch_command(":w")
+        \\
+        \\assert(editor.read_file("/tmp/em_oil_test/alpha.txt") ~= nil)
+        \\assert(editor.read_file("/tmp/em_oil_test/a.txt") == nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_oil_save_delete" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/sub", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/b.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/a.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/alpha.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test", true) end)
+        \\editor.fs_mkdir("/tmp/em_oil_test")
+        \\editor.fs_mkdir("/tmp/em_oil_test/sub")
+        \\editor.fs_touch("/tmp/em_oil_test/b.txt")
+        \\editor.fs_touch("/tmp/em_oil_test/alpha.txt")
+        \\
+        \\editor.dispatch_command(":e /tmp/em_oil_test")
+        \\local cur = editor.get_current_buffer()
+        \\cur:delete(0, cur:len())
+        \\cur:insert(0, "sub/\nalpha.txt\n")
+        \\
+        \\editor.dispatch_command(":w")
+        \\
+        \\assert(editor.read_file("/tmp/em_oil_test/b.txt") == nil)
+    ;
+    try run_lua_test(script);
+}
+
+test "test_lua_oil_save_create" {
+    const script =
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/sub", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/new_dir", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/b.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/a.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/alpha.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/gamma.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test", true) end)
+        \\editor.fs_mkdir("/tmp/em_oil_test")
+        \\editor.fs_mkdir("/tmp/em_oil_test/sub")
+        \\editor.fs_touch("/tmp/em_oil_test/alpha.txt")
+        \\
+        \\editor.dispatch_command(":e /tmp/em_oil_test")
+        \\local cur = editor.get_current_buffer()
+        \\cur:delete(0, cur:len())
+        \\cur:insert(0, "sub/\nnew_dir/\nalpha.txt\ngamma.txt\n")
+        \\
+        \\editor.dispatch_command(":w")
+        \\
+        \\assert(editor.is_dir("/tmp/em_oil_test/new_dir") == true)
+        \\assert(editor.read_file("/tmp/em_oil_test/gamma.txt") ~= nil)
+        \\
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/sub", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/new_dir", true) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/alpha.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test/gamma.txt", false) end)
+        \\pcall(function() editor.fs_delete("/tmp/em_oil_test", true) end)
     ;
     try run_lua_test(script);
 }

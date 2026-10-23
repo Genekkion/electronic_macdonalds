@@ -13,6 +13,7 @@ pub const search = @import("buffer/search.zig");
 pub const lua = @import("lua/buffer_binding.zig");
 pub const config = @import("lua/config.zig");
 pub const events = @import("lua/events.zig");
+pub const fs = @import("lua/fs.zig");
 pub const viewport = @import("render/viewport.zig");
 pub const font = @import("render/font.zig");
 pub const status_line = @import("render/status_line.zig");
@@ -43,4 +44,5 @@ test {
     _ = @import("buffer/search.zig");
     _ = @import("lua/config.zig");
     _ = @import("lua/events.zig");
+    _ = @import("lua/fs.zig");
 }

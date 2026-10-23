@@ -360,6 +360,14 @@ pub const Buffer = struct {
         } else |_| {}
     }
 
+    pub fn set_file_path(self: *Buffer, path: []const u8) !void {
+        if (self.file_path) |old_p| {
+            self.allocator.free(old_p);
+            self.file_path = null;
+        }
+        self.file_path = try self.allocator.dupeZ(u8, path);
+    }
+
     pub fn load_from_file(allocator: Allocator, path: [:0]const u8) FileError!Buffer {
         const f = std.c.fopen(path.ptr, "rb") orelse return error.FileNotFound;
         defer _ = std.c.fclose(f);

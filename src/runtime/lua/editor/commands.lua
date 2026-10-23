@@ -105,6 +105,11 @@ editor.create_command("w", function(args)
         return
     end
 
+    if editor.oil and editor.oil.is_oil_buffer(cur_buf) and (not args or args == "") then
+        editor.oil.save(cur_buf)
+        return
+    end
+
     local path = args
     if not path or path == "" then
         path = (cur_buf.get_path and cur_buf:get_path()) or ""
@@ -120,6 +125,79 @@ editor.create_command("w", function(args)
         editor.set_status('"' .. path .. '" written')
     else
         editor.set_error("Write error: " .. tostring(msg or err))
+    end
+end)
+
+--- Open a path (file or directory)
+function editor.edit_path(path)
+    if not path or path == "" then
+        local cur = editor.get_current_buffer()
+        if cur and cur.get_path and cur:get_path() and cur:get_path() ~= "" then
+            path = cur:get_path()
+        else
+            editor.set_error("No file name")
+            return false
+        end
+    end
+
+    path = path:match("^%s*(.-)%s*$")
+    if path == "" then
+        editor.set_error("No file name")
+        return false
+    end
+
+    -- Check if directory
+    if (editor.is_dir and editor.is_dir(path)) or path == "." or path:match("/$") then
+        if editor.oil then
+            return editor.oil.open(path) ~= nil
+        end
+    end
+
+    -- Check if already open in a buffer
+    for _, b_info in ipairs(editor.list_buffers()) do
+        local b = editor.get_buffer_by_id(b_info.id)
+        if b and b.get_path and b:get_path() == path then
+            editor.set_current_buffer(b)
+            return true
+        end
+    end
+
+    -- Try loading existing file from disk
+    local buf, err, msg = editor.read_file(path)
+    if buf then
+        editor.set_current_buffer(buf)
+        return true
+    end
+
+    -- File does not exist yet: create empty buffer associated with path
+    local new_buf, n_err, n_msg = editor.create_buffer()
+    if new_buf then
+        if new_buf.set_path then
+            new_buf:set_path(path)
+        end
+        editor.set_current_buffer(new_buf)
+        editor.set_status('"' .. path .. '" [New File]')
+        return true
+    end
+
+    editor.set_error("Failed to open file: " .. tostring(msg or n_msg))
+    return false
+end
+
+-- :e [path] / :edit [path]
+editor.create_command("e", function(args)
+    editor.edit_path(args)
+end)
+
+editor.create_command("edit", function(args)
+    editor.edit_path(args)
+end)
+
+-- :Oil [path]
+editor.create_command("Oil", function(args)
+    local p = (args and args ~= "") and args or "."
+    if editor.oil then
+        editor.oil.open(p)
     end
 end)
 
@@ -160,22 +238,6 @@ editor.create_command("wq", function(args)
         end
     end
     editor.quit(true)
-end)
-
--- :e <path> - Edit / open a file
-editor.create_command("e", function(path)
-    if not path or path == "" then
-        editor.set_error("Argument required")
-        return
-    end
-
-    local buf, err, msg = editor.read_file(path)
-    if buf then
-        editor.set_current_buffer(buf)
-        editor.set_status('"' .. path .. '" opened')
-    else
-        editor.set_error("Cannot open file: " .. tostring(msg or err))
-    end
 end)
 
 local function parse_substitute(args)
